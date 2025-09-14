@@ -19,6 +19,8 @@ class RaydiumConfig:
 
 
 class EndpointRotator:
+    """Simple failover: iterate endpoints on failure without retrying the same one."""
+
     def __init__(self, endpoints: List[str]):
         if not endpoints:
             raise ValueError("At least one RPC endpoint is required")
@@ -47,35 +49,37 @@ class RaydiumAdapter:
         with open(config_path_abs, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
 
-        sol = cfg["solana"]
-        ray = cfg["raydium"]
+        try:
+            sol = cfg["solana"]
+            ray = cfg["raydium"]
+        except Exception as exc:
+            raise ValueError("Invalid configuration structure. Expected keys: solana, raydium") from exc
 
         self.config = RaydiumConfig(
-            cluster=sol["cluster"],
-            rpc_endpoints=sol["rpc_endpoints"],
+            cluster=sol.get("cluster"),
+            rpc_endpoints=sol.get("rpc_endpoints", []),
             wss_endpoints=sol.get("wss_endpoints", []),
-            keypair_path=sol["keypair_path"],
-            program_id_clmm=ray["program_id_clmm"],
+            keypair_path=sol.get("keypair_path"),
+            program_id_clmm=ray.get("program_id_clmm"),
         )
+
+        if not self.config.cluster:
+            raise ValueError("solana.cluster is required")
+        if not self.config.rpc_endpoints:
+            raise ValueError("solana.rpc_endpoints must contain at least one endpoint")
+        if not self.config.program_id_clmm:
+            raise ValueError("raydium.program_id_clmm is required")
 
         self.rpc = EndpointRotator(self.config.rpc_endpoints)
         self.logger.info("RaydiumAdapter inicializado (cluster=%s, endpoints=%d)", self.config.cluster, len(self.config.rpc_endpoints))
 
-        try:
-            idl = ClmmDecoder.fetch_idl_onchain(
-                program_id=self.config.program_id_clmm,
-                cluster=self.config.cluster,
-                wallet_path=self.config.keypair_path,
-            )
-            self.logger.debug("IDL obtenido on-chain para %s", self.config.program_id_clmm)
-        except Exception as exc:
-            self.logger.warning("Fallo al obtener IDL on-chain (%s). Usando fallback local.", exc)
-            config_dir = os.path.dirname(config_path_abs)
-            local_idl_path = os.path.join(config_dir, f"{self.config.program_id_clmm}-idl.json")
-            with open(local_idl_path, "r", encoding="utf-8") as f:
-                idl = json.load(f)
-
+        idl = ClmmDecoder.fetch_idl_onchain(
+            program_id=self.config.program_id_clmm,
+            cluster=self.config.cluster,
+            wallet_path=self.config.keypair_path,
+        )
         self.decoder = ClmmDecoder(idl)
+
         self.owner_pubkey = self._derive_owner_from_keypair(self.config.keypair_path)
 
     def _derive_owner_from_keypair(self, keypair_path: str) -> str:
@@ -110,50 +114,42 @@ class RaydiumAdapter:
                 self.rpc.rotate()
         raise RuntimeError("All RPC endpoints failed") from last_error
 
-    def _owner_holds_nft_mint(self, owner_pubkey: str, mint_pubkey: str) -> bool:
-        data = self._rpc_call_with_failover("getTokenAccountsByOwner", [owner_pubkey, {"mint": mint_pubkey}, {"encoding": "jsonParsed"}])
-        value = (data.get("result", {}) or {}).get("value", [])
-        for entry in value:
-            amount = entry["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
-            if int(amount) > 0:
-                return True
-        return False
+    def _derive_personal_position_pda(self, nft_mint_b58: str) -> Tuple[str, int]:
+        try:
+            from solders.pubkey import Pubkey  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("Falta dependencia 'solders'. Instala con: pip install solders") from exc
+        program = Pubkey.from_string(self.config.program_id_clmm)
+        mint_pk = Pubkey.from_string(nft_mint_b58)
+        pda, bump = Pubkey.find_program_address([b"position", bytes(mint_pk)], program)
+        return str(pda), bump
+
+    def _get_account_info_base64(self, pubkey: str) -> Optional[str]:
+        data = self._rpc_call_with_failover("getAccountInfo", [pubkey, {"encoding": "base64"}])
+        result = data.get("result") or {}
+        value = result.get("value") if isinstance(result, dict) else None
+        if not value:
+            return None
+        arr = value.get("data", [None, None]) if isinstance(value, dict) else [None, None]
+        return arr[0]
 
     def _check_position_exists(self, position_nft_mint: str, pool_address: Optional[str] = None) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        acc_name, pool_offset, nft_mint_offset = self.decoder.infer_position_offsets()
-
-        filters = [{"memcmp": {"offset": nft_mint_offset, "bytes": position_nft_mint}}]
-        if pool_address:
-            filters.append({"memcmp": {"offset": pool_offset, "bytes": pool_address}})
-        data = self._rpc_call_with_failover("getProgramAccounts", [self.config.program_id_clmm, {"encoding": "base64", "filters": filters, "commitment": "confirmed"}])
-        result = data.get("result", []) or []
-        if not result:
-            return False, None
-
         import base64  # type: ignore
-        import base58  # type: ignore
 
-        for acc in result:
-            b64 = (acc.get("account", {}).get("data", [None, None]) or [None, None])[0]
-            if not b64:
-                continue
-            raw = base64.b64decode(b64)
-            if not self._owner_holds_nft_mint(self.owner_pubkey, position_nft_mint):
-                continue
-            if not pool_address and len(raw) >= pool_offset + 32:
-                pool_address = base58.b58encode(raw[pool_offset:pool_offset + 32]).decode("utf-8")
-            account_pubkey = acc.get("pubkey")
-            if not isinstance(account_pubkey, str):
-                continue
-            details = self.decoder.anchor_cli_decode(
-                program_id=self.config.program_id_clmm,
-                account_type=acc_name,
-                account_pubkey=account_pubkey,
-                cluster=self.config.cluster,
-                wallet_path=self.config.keypair_path,
-            )
-            return True, details
-        return False, None
+        acc_name, _, _ = self.decoder.infer_position_offsets()
+        pda, _bump = self._derive_personal_position_pda(position_nft_mint)
+        b64 = self._get_account_info_base64(pda)
+        if not b64:
+            return False, None
+        raw = base64.b64decode(b64)
+        details = self.decoder.anchor_cli_decode(
+            program_id=self.config.program_id_clmm,
+            account_type=acc_name,
+            account_pubkey=pda,
+            cluster=self.config.cluster,
+            wallet_path=self.config.keypair_path,
+        )
+        return True, details
 
     def check_position_exists_tool(self, position_nft_mint: str, pool_address: Optional[str] = None) -> Dict[str, Any]:
         if not position_nft_mint:

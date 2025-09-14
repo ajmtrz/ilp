@@ -3,8 +3,10 @@ solana:
   cluster: mainnet-beta
   rpc_endpoints:
     - https://api.mainnet-beta.solana.com
+    - https://solana.drpc.org
   wss_endpoints:
     - wss://api.mainnet-beta.solana.com
+    - wss://solana.drpc.org
   keypair_path: ~/.config/solana/id.json
 raydium:
   program_id_clmm: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
