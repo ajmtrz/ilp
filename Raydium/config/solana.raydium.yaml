@@ -1,0 +1,10 @@
+# Raydium + Solana configuration for CLMM pools
+solana:
+  cluster: mainnet-beta
+  rpc_endpoints:
+    - https://api.mainnet-beta.solana.com
+  wss_endpoints:
+    - wss://api.mainnet-beta.solana.com
+  keypair_path: ~/.config/solana/id.json
+raydium:
+  program_id_clmm: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
