@@ -1,0 +1,7 @@
+# Hedera + SaucerSwap configuration
+hedera:
+  network: mainnet
+  wallet:
+    private_key_path: ~/.secure/hedera/id.json
+saucerswap:
+  api_base: https://api.saucerswap.finance
