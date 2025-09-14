@@ -108,7 +108,6 @@ class SaucerSwapAdapter:
                 if (pool_fee == fee and 
                     ((token_a_id == token0_id and token_b_id == token1_id) or
                      (token_a_id == token1_id and token_b_id == token0_id))):
-                    self.logger.debug(f"Pool encontrada: ID={pool.get('id')}, tickCurrent={pool.get('tickCurrent')}")
                     return pool
                     
             except Exception as exc:
@@ -173,7 +172,6 @@ class SaucerSwapAdapter:
                     # Agregar tickCurrent si se encontró la pool
                     if pool_info:
                         position_details["tickCurrent"] = pool_info.get("tickCurrent")
-                        position_details["poolId"] = pool_info.get("id")
                         self.logger.info(f"Pool encontrada: ID={pool_info.get('id')}, tickCurrent={pool_info.get('tickCurrent')}")
                     else:
                         self.logger.warning(f"No se pudo encontrar información de la pool para la posición {serial}")

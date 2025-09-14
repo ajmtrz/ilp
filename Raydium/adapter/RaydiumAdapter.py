@@ -112,6 +112,7 @@ class RaydiumAdapter:
                 self.logger.warning("RPC endpoint failed (%s): %s", url, exc)
                 last_error = exc
                 self.rpc.rotate()
+        self.logger.error("Todos los endpoints RPC fallaron")
         raise RuntimeError("All RPC endpoints failed") from last_error
 
     def _derive_personal_position_pda(self, nft_mint_b58: str) -> Tuple[str, int]:
@@ -125,13 +126,18 @@ class RaydiumAdapter:
         return str(pda), bump
 
     def _get_account_info_base64(self, pubkey: str) -> Optional[str]:
-        data = self._rpc_call_with_failover("getAccountInfo", [pubkey, {"encoding": "base64"}])
-        result = data.get("result") or {}
-        value = result.get("value") if isinstance(result, dict) else None
-        if not value:
+        try:
+            data = self._rpc_call_with_failover("getAccountInfo", [pubkey, {"encoding": "base64"}])
+            result = data.get("result") or {}
+            value = result.get("value") if isinstance(result, dict) else None
+            if not value:
+                self.logger.debug("Cuenta no encontrada: %s", pubkey)
+                return None
+            arr = value.get("data", [None, None]) if isinstance(value, dict) else [None, None]
+            return arr[0]
+        except Exception as exc:
+            self.logger.error("Error obteniendo información de cuenta %s: %s", pubkey, exc)
             return None
-        arr = value.get("data", [None, None]) if isinstance(value, dict) else [None, None]
-        return arr[0]
 
     def _decode_account(self, account_type: str, pubkey: str, raw_b64: str) -> Dict[str, Any]:
         import base64  # type: ignore
@@ -147,35 +153,46 @@ class RaydiumAdapter:
     def check_position_exists_tool(self, position_nft_mint: str, pool_address: Optional[str] = None) -> Dict[str, Any]:
         if not position_nft_mint:
             return {"exists": False, "details": {"reason": "missing position_nft_mint"}}
-        # 1) Derivar PDA y leer posición
-        acc_name, _, _ = self.decoder.infer_position_offsets()
-        pda, _bump = self._derive_personal_position_pda(position_nft_mint)
-        pos_b64 = self._get_account_info_base64(pda)
-        if not pos_b64:
-            return {"exists": False, "details": {}}
-        pos_details = self._decode_account(acc_name, pda, pos_b64)
-        if not isinstance(pos_details, dict):
-            return {"exists": False, "details": {}}
-        # 2) Leer pool y extraer tick actual
-        pool_id = pos_details.get("pool_id")
-        current_tick: Optional[int] = None
-        if isinstance(pool_id, str) and pool_id:
-            pool_b64 = self._get_account_info_base64(pool_id)
-            if pool_b64:
-                pool_details = self._decode_account("PoolState", pool_id, pool_b64)
-                # Intentar diferentes nombres comunes
-                for key in ("tick_current_index", "tickCurrentIndex", "tick_current", "current_tick_index"):
-                    if isinstance(pool_details, dict) and key in pool_details:
-                        try:
-                            current_tick = int(pool_details[key])
-                        except Exception:
-                            pass
-                        break
-        # 3) Unir y devolver
-        merged = dict(pos_details)
-        if current_tick is not None:
-            merged["tick_current"] = current_tick
-        return {"exists": True, "details": merged}
+        try:
+            # 1) Derivar PDA y leer posición
+            acc_name, _, _ = self.decoder.infer_position_offsets()
+            pda, _bump = self._derive_personal_position_pda(position_nft_mint)
+            pos_b64 = self._get_account_info_base64(pda)
+            if not pos_b64:
+                return {"exists": False, "details": {}}
+            pos_details = self._decode_account(acc_name, pda, pos_b64)
+            if not isinstance(pos_details, dict):
+                return {"exists": False, "details": {}}
+            # 2) Leer pool y extraer tick actual
+            pool_id = pos_details.get("pool_id")
+            current_tick: Optional[int] = None
+            if isinstance(pool_id, str) and pool_id:
+                pool_b64 = self._get_account_info_base64(pool_id)
+                if pool_b64:
+                    pool_details = self._decode_account("PoolState", pool_id, pool_b64)
+                    # Intentar diferentes nombres comunes
+                    for key in ("tick_current_index", "tickCurrentIndex", "tick_current", "current_tick_index"):
+                        if isinstance(pool_details, dict) and key in pool_details:
+                            try:
+                                current_tick = int(pool_details[key])
+                                self.logger.info("Pool encontrada: ID=%s, tickCurrent=%s", pool_id, current_tick)
+                                break
+                            except Exception:
+                                pass
+                    if current_tick is None:
+                        self.logger.warning("No se pudo extraer tickCurrent de la pool %s", pool_id)
+                else:
+                    self.logger.warning("Cuenta de pool no encontrada: %s", pool_id)
+            else:
+                self.logger.warning("pool_id inválido en posición: %s", pool_id)
+            # 3) Unir y devolver
+            merged = dict(pos_details)
+            if current_tick is not None:
+                merged["tick_current"] = current_tick
+            return {"exists": True, "details": merged}
+        except Exception as exc:
+            self.logger.error("Error verificando posición %s: %s", position_nft_mint, exc)
+            return {"exists": False, "details": {"error": f"position check failed: {exc}"}}
 
 
 __all__ = ["RaydiumAdapter", "RaydiumConfig"]
