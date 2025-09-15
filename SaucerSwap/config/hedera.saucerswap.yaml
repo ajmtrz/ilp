@@ -1,7 +1,16 @@
 # Hedera + SaucerSwap configuration
 hedera:
   network: mainnet
+  json_rpc_endpoints:
+    - https://mainnet.hashio.io/api
   wallet:
     private_key_path: ~/.secure/hedera/id.json
 saucerswap:
   api_base: https://api.saucerswap.finance
+  contracts:
+    quoter_v2: 0.0.3949424       # Rellena con el ContractId real
+    swap_router: 0.0.3949434     # Rellena con el ContractId real
+    whbar: 0.0.1456986           # Rellena con el TokenId WHBAR
+  abi_files:
+    quoter_v2: LiquidityProvider/SaucerSwap/config/QuoterV2.json
+    swap_router: LiquidityProvider/SaucerSwap/config/SwapRouter.json
