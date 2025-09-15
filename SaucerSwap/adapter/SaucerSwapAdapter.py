@@ -14,6 +14,7 @@ class SaucerSwapConfig:
     api_base: str
     json_rpc_endpoints: List[str]
     contracts: Dict[str, str]
+    abi_files: Dict[str, str]
 
 
 class EndpointRotator:
@@ -57,6 +58,7 @@ class SaucerSwapAdapter:
             api_base=ssw["api_base"],
             json_rpc_endpoints=hed.get("json_rpc_endpoints", []),
             contracts=ssw.get("contracts", {}),
+            abi_files=ssw.get("abi_files", {}),
         )
 
         # account_id desde keyfile
@@ -75,6 +77,17 @@ class SaucerSwapAdapter:
         # ABI del router (para decodificar errores)
         self._router_abi: Optional[List[Dict[str, Any]]] = None
         self._router_error_index: Optional[Dict[bytes, Dict[str, Any]]] = None
+        self._router_abi_path: Optional[str] = None
+        self._quoter_abi: Optional[List[Dict[str, Any]]] = None
+        self._quoter_abi_path: Optional[str] = None
+
+        # Resolver rutas ABI desde YAML si están presentes
+        try:
+            abi_cfg = self.config.abi_files or {}
+            self._router_abi_path = self._resolve_path_from_project_root(abi_cfg.get("swap_router"))
+            self._quoter_abi_path = self._resolve_path_from_project_root(abi_cfg.get("quoter_v2"))
+        except Exception:
+            pass
 
     # ---------------- Claves/EVM helpers ----------------
     def _extract_private_key_hex(self, key_json: Dict[str, Any]) -> str:
@@ -112,10 +125,31 @@ class SaucerSwapAdapter:
         return to_checksum_address(pk.public_key.to_checksum_address())
 
     # ---------------- ABI helpers ----------------
+    def _project_root(self) -> str:
+        # .../LiquidityProvider/SaucerSwap/adapter -> go up 3 = LiquidityProvider
+        return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def _resolve_path_from_project_root(self, path: Optional[str]) -> Optional[str]:
+        if not path:
+            return None
+        if os.path.isabs(path):
+            return path
+        return os.path.abspath(os.path.join(self._project_root(), path))
+
     def _get_router_abi_path(self) -> str:
-        # LiquidityProvider/SaucerSwap/config/SwapRouter.json
+        if self._router_abi_path and os.path.exists(self._router_abi_path):
+            return self._router_abi_path
+        # Fallback: LiquidityProvider/SaucerSwap/config/SwapRouter.json
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(base, "config", "SwapRouter.json")
+
+    def _get_quoter_abi_path(self) -> Optional[str]:
+        if self._quoter_abi_path and os.path.exists(self._quoter_abi_path):
+            return self._quoter_abi_path
+        # opcional: QuoterV2.json en config si estuviera presente con ese nombre
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(base, "config", "QuoterV2.json")
+        return candidate if os.path.exists(candidate) else None
 
     def _ensure_router_abi_loaded(self) -> None:
         if self._router_abi is not None and self._router_error_index is not None:
@@ -141,6 +175,61 @@ class SaucerSwapAdapter:
                 sig = f"{name}({types})"
                 selector = eth_utils.keccak(text=sig)[:4]
                 self._router_error_index[bytes(selector)] = {"name": name, "inputs": inputs}
+
+    def _ensure_quoter_abi_loaded(self) -> None:
+        if self._quoter_abi is not None:
+            return
+        path = self._get_quoter_abi_path()
+        if not path:
+            self._quoter_abi = []
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._quoter_abi = json.load(f)
+        except Exception as exc:
+            self.logger.warning("No se pudo cargar Quoter ABI: %s", exc)
+            self._quoter_abi = []
+
+    def _abi_find_function(self, abi_list: Optional[List[Dict[str, Any]]], name: str, input_types: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        if not abi_list:
+            return None
+        for entry in abi_list:
+            if entry.get("type") != "function":
+                continue
+            if entry.get("name") != name:
+                continue
+            if input_types is None:
+                return entry
+            ins = [i.get("type") for i in entry.get("inputs", [])]
+            if ins == input_types:
+                return entry
+        return None
+
+    def _abi_selector_from_entry(self, entry: Dict[str, Any]) -> Optional[bytes]:
+        try:
+            import eth_utils  # type: ignore
+        except Exception:
+            return None
+        try:
+            ins = ",".join(i.get("type") for i in entry.get("inputs", []))
+            sig = f"{entry.get('name')}({ins})"
+            return eth_utils.keccak(text=sig)[:4]
+        except Exception:
+            return None
+
+    def _abi_output_types(self, entry: Optional[Dict[str, Any]]) -> Optional[List[str]]:
+        if not entry:
+            return None
+        outs = entry.get("outputs") or []
+        if not isinstance(outs, list):
+            return None
+        types: List[str] = []
+        for o in outs:
+            t = o.get("type")
+            if not isinstance(t, str):
+                return None
+            types.append(t)
+        return types or None
 
     def _decode_revert_data(self, data_hex: str) -> Optional[Dict[str, Any]]:
         # Maneja Error(string), Panic(uint256) y errores personalizados del ABI
@@ -298,11 +387,15 @@ class SaucerSwapAdapter:
         if not quoter.startswith("0x"):
             raise ValueError("quoter_v2 no configurado correctamente")
 
+        # Preferimos construir selector desde ABI si está presente
+        self._ensure_quoter_abi_loaded()
         if kind == "exact_in":
-            selector = eth_utils.keccak(text="quoteExactInput(bytes,uint256)")[:4]
+            entry = self._abi_find_function(self._quoter_abi, "quoteExactInput", ["bytes", "uint256"]) or {}
+            selector = self._abi_selector_from_entry(entry) or eth_utils.keccak(text="quoteExactInput(bytes,uint256)")[:4]
             calldata = selector + abi_encode(["bytes", "uint256"], [path, amount])
         elif kind == "exact_out":
-            selector = eth_utils.keccak(text="quoteExactOutput(bytes,uint256)")[:4]
+            entry = self._abi_find_function(self._quoter_abi, "quoteExactOutput", ["bytes", "uint256"]) or {}
+            selector = self._abi_selector_from_entry(entry) or eth_utils.keccak(text="quoteExactOutput(bytes,uint256)")[:4]
             tokens_rev = list(reversed(tokens))
             fees_rev = list(reversed(fees))
             path_rev = self._encode_path_v2(tokens_rev, fees_rev)
@@ -311,7 +404,12 @@ class SaucerSwapAdapter:
             raise ValueError("kind debe ser 'exact_in' o 'exact_out'")
 
         result = self._call_rpc("eth_call", [{"to": quoter, "data": "0x" + calldata.hex()}, "latest"])
-        decoded = abi_decode(["uint256", "uint160[]", "uint32[]", "uint256"], bytes.fromhex(result[2:]))
+        # Intentar decodificar outputs desde ABI si disponible
+        out_types = self._abi_output_types(self._abi_find_function(self._quoter_abi, "quoteExactInput" if kind == "exact_in" else "quoteExactOutput", ["bytes", "uint256"]))
+        if out_types == ["uint256", "uint160[]", "uint32[]", "uint256"] or out_types is None:
+            decoded = abi_decode(["uint256", "uint160[]", "uint32[]", "uint256"], bytes.fromhex(result[2:]))
+        else:
+            decoded = abi_decode(out_types, bytes.fromhex(result[2:]))
         return {
             ("amountOut" if kind == "exact_in" else "amountIn"): int(decoded[0]),
             "sqrtPriceX96AfterList": [int(x) for x in decoded[1]],
