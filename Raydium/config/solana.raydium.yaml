@@ -10,3 +10,5 @@ solana:
   keypair_path: ~/.config/solana/id.json
 raydium:
   program_id_clmm: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
+  api_base: https://transaction-v1.raydium.io
+  priority_fee_tier: h   # vh|h|m

@@ -16,6 +16,8 @@ class RaydiumConfig:
     wss_endpoints: List[str]
     keypair_path: str
     program_id_clmm: str
+    api_base: str
+    priority_fee_tier: str
 
 
 class EndpointRotator:
@@ -61,6 +63,8 @@ class RaydiumAdapter:
             wss_endpoints=sol.get("wss_endpoints", []),
             keypair_path=sol.get("keypair_path"),
             program_id_clmm=ray.get("program_id_clmm"),
+            api_base=ray.get("api_base", "https://transaction-v1.raydium.io"),
+            priority_fee_tier=str(ray.get("priority_fee_tier", "h")).lower(),
         )
 
         if not self.config.cluster:
@@ -69,9 +73,17 @@ class RaydiumAdapter:
             raise ValueError("solana.rpc_endpoints must contain at least one endpoint")
         if not self.config.program_id_clmm:
             raise ValueError("raydium.program_id_clmm is required")
+        if self.config.priority_fee_tier not in ("vh", "h", "m"):
+            raise ValueError("raydium.priority_fee_tier must be one of: vh, h, m")
 
         self.rpc = EndpointRotator(self.config.rpc_endpoints)
-        self.logger.info("RaydiumAdapter inicializado (cluster=%s, endpoints=%d)", self.config.cluster, len(self.config.rpc_endpoints))
+        self.logger.info(
+            "RaydiumAdapter inicializado (cluster=%s, rpc_endpoints=%d, api_base=%s, tx=v0, fee_tier=%s)",
+            self.config.cluster,
+            len(self.config.rpc_endpoints),
+            self.config.api_base,
+            self.config.priority_fee_tier,
+        )
 
         idl = ClmmDecoder.fetch_idl_onchain(
             program_id=self.config.program_id_clmm,
@@ -81,6 +93,260 @@ class RaydiumAdapter:
         self.decoder = ClmmDecoder(idl)
 
         self.owner_pubkey = self._derive_owner_from_keypair(self.config.keypair_path)
+        self.SOL_MINT = "So11111111111111111111111111111111111111112"
+
+    # ---------------- Raydium Trade API: Quote ----------------
+    def get_quote(self, input_mint: str, output_mint: str, amount: int, kind: str, slippage_bps: int) -> Dict[str, Any]:
+        if kind not in ("exact_in", "exact_out"):
+            raise ValueError("kind debe ser 'exact_in' o 'exact_out'")
+        if not input_mint or not output_mint:
+            raise ValueError("input_mint y output_mint son obligatorios")
+        if int(amount) <= 0:
+            raise ValueError("amount debe ser > 0 (en unidades mínimas)")
+        if not (0 < int(slippage_bps) <= 10_000):
+            raise ValueError("slippage_bps fuera de rango (1..10000)")
+        # Autodetectar wrap/unwrap según mints
+        wrap_sol = (input_mint == self.SOL_MINT)
+        unwrap_sol = (output_mint == self.SOL_MINT)
+        path = "compute/swap-base-in" if kind == "exact_in" else "compute/swap-base-out"
+        params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(int(amount)),
+            "slippageBps": int(slippage_bps),
+            "txVersion": "V0",
+        }
+        data = self._api_get(path, params=params)
+        if isinstance(data, dict) and data.get("success") is False and data.get("message"):
+            raise RuntimeError(f"Raydium compute error: {data.get('message')}")
+        # La API devuelve un objeto complejo; encapsulamos lo esencial y guardamos swapResponse completo
+        return {
+            "swapResponse": data,
+            "kind": kind,
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": int(amount),
+            "slippageBps": int(slippage_bps),
+            "wrapSol": bool(wrap_sol),
+            "unwrapSol": bool(unwrap_sol),
+        }
+
+    # ---------------- Raydium Trade API: Prepare ----------------
+    def _derive_ata(self, owner_pubkey: str, mint: str) -> Optional[str]:
+        """Deriva Associated Token Account (ATA) para (owner,mint)."""
+        try:
+            from solders.pubkey import Pubkey  # type: ignore
+        except Exception as exc:
+            self.logger.warning("solders no disponible para derivar ATA: %s", exc)
+            return None
+        try:
+            TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            ATA_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+            owner_pk = Pubkey.from_string(owner_pubkey)
+            mint_pk = Pubkey.from_string(mint)
+            seeds = [bytes(owner_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pk)]
+            ata, _bump = Pubkey.find_program_address(seeds, ATA_PROGRAM_ID)
+            return str(ata)
+        except Exception as exc:
+            self.logger.warning("Error derivando ATA: %s", exc)
+            return None
+
+    def swap_prepare(self, swap_quote: Dict[str, Any]) -> Dict[str, Any]:
+        kind = swap_quote.get("kind")
+        if kind not in ("exact_in", "exact_out"):
+            raise ValueError("swap_quote.kind inválido")
+        # Obtener prioridad
+        priority = self._get_priority_fee_micro_lamports()
+        if priority is None:
+            # fallback conservador si la API no devuelve datos
+            priority = {"vh": 1_000_000, "h": 500_000, "m": 200_000}.get(self.config.priority_fee_tier, 500_000)
+        payload = {
+            "computeUnitPriceMicroLamports": str(priority) if priority is not None else None,
+            "swapResponse": swap_quote.get("swapResponse"),
+            "txVersion": "V0",
+            "wallet": self.owner_pubkey,
+        }
+        # wrap/unwrap SOL
+        wrap_sol = bool(swap_quote.get("wrapSol"))
+        unwrap_sol = bool(swap_quote.get("unwrapSol"))
+        if wrap_sol:
+            payload["wrapSol"] = True
+        if unwrap_sol:
+            payload["unwrapSol"] = True
+        # input/output accounts
+        input_mint = swap_quote.get("inputMint")
+        output_mint = swap_quote.get("outputMint")
+        if input_mint and input_mint != self.SOL_MINT:  # no SOL nativo
+            ata_in = self._derive_ata(self.owner_pubkey, input_mint)
+            if ata_in:
+                payload["inputAccount"] = ata_in
+        if output_mint and output_mint == self.SOL_MINT:
+            # si se desea SOL nativo, la API soporta unwrapSol
+            payload["unwrapSol"] = True
+
+        path = "transaction/swap-base-in" if kind == "exact_in" else "transaction/swap-base-out"
+        res = self._api_post(path, payload)
+        if isinstance(res, dict) and res.get("success") is False and res.get("message"):
+            raise RuntimeError(f"Raydium transaction error: {res.get('message')}")
+        # Extraer transacciones de forma robusta (puede venir list o dict)
+        transactions: List[str] = []
+        items: List[Any] = []
+        if isinstance(res, list):
+            items = res
+        elif isinstance(res, dict):
+            data_field = res.get("data")
+            if isinstance(data_field, list):
+                items = data_field
+            elif isinstance(data_field, dict):
+                items = [data_field]
+            else:
+                # a veces la tx está directamente en res
+                items = [res]
+        for it in items:
+            if isinstance(it, dict) and isinstance(it.get("transaction"), str):
+                transactions.append(it["transaction"])
+        if not transactions:
+            raise RuntimeError("Raydium API no devolvió transacciones a firmar")
+        return {
+            "transactions": transactions,
+            "txVersion": "V0",
+        }
+
+    # ---------------- Raydium Trade API: Send ----------------
+    def _load_solana_keypair(self):
+        try:
+            from solders.keypair import Keypair  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"Falta dependencia solders: {exc}")
+        expanded_path = os.path.expanduser(self.config.keypair_path)
+        with open(expanded_path, "r", encoding="utf-8") as f:
+            key_data = json.load(f)
+        secret = bytes(key_data)
+        # Formato estándar Solana: 64 bytes (priv||pub)
+        if len(secret) == 64:
+            return Keypair.from_bytes(secret)
+        # Si viniera 32 bytes, usar como seed
+        seed = secret[:32]
+        return Keypair.from_seed(seed)
+
+    def _rpc_client(self):
+        try:
+            from solana.rpc.api import Client  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"Falta dependencia solana-py: {exc}")
+        return Client(self.rpc.current)
+
+    def swap_send(self, prep: Dict[str, Any], wait: bool = True) -> Dict[str, Any]:
+        try:
+            from solana.rpc.api import Client  # type: ignore
+            from solana.rpc.types import TxOpts  # type: ignore
+            from solders.transaction import VersionedTransaction  # type: ignore
+            from solders.signature import Signature as SolSig  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"Faltan dependencias para V0: {exc}")
+
+        kp = self._load_solana_keypair()
+        client = self._rpc_client()
+        signatures: List[str] = []
+        receipts: List[Dict[str, Any]] = []
+        def _extract_sig(resp_obj: Any) -> Optional[str]:
+            if isinstance(resp_obj, dict):
+                return resp_obj.get("result") or resp_obj.get("value") or resp_obj.get("signature")
+            # RPCResponse-like
+            val = getattr(resp_obj, "value", None)
+            if isinstance(val, str):
+                return val
+            # Fallback to string
+            try:
+                s = str(resp_obj)
+                if not s:
+                    return None
+                # Intenta extraer base58 de "Signature(<base58>)"
+                import re
+                m = re.search(r"Signature\(([1-9A-HJ-NP-Za-km-z]{32,})\)", s)
+                if m:
+                    return m.group(1)
+                return s
+            except Exception:
+                return None
+        def _to_jsonable(obj: Any) -> Any:
+            if isinstance(obj, (str, int, float, bool)) or obj is None:
+                return obj
+            if isinstance(obj, dict):
+                return {k: _to_jsonable(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_to_jsonable(x) for x in obj]
+            val = getattr(obj, "value", None)
+            if val is not None:
+                return {"value": _to_jsonable(val)}
+            to_dict = getattr(obj, "to_dict", None)
+            if callable(to_dict):
+                try:
+                    return to_dict()
+                except Exception:
+                    pass
+            try:
+                return str(obj)
+            except Exception:
+                return None
+        for tx_b64 in prep.get("transactions", []):
+            raw = __import__("base64").b64decode(tx_b64)
+            sig = None
+            try:
+                vtx = VersionedTransaction.from_bytes(raw)
+                # Firmar la transacción con nuestro keypair
+                msg = vtx.message
+                signed_vtx = VersionedTransaction(msg, [kp])
+                opts = TxOpts(skip_preflight=True, preflight_commitment="confirmed")
+                resp = client.send_raw_transaction(bytes(signed_vtx), opts=opts)
+                sig = _extract_sig(resp)
+            except Exception as exc:
+                self.logger.error("Error enviando transacción v0: %s", exc)
+                receipts.append({"error": str(exc)})
+                continue
+            signatures.append(sig)
+            if wait and sig:
+                try:
+                    sig_obj = SolSig.from_string(sig) if isinstance(sig, str) else sig
+                    conf = client.confirm_transaction(sig_obj, commitment="confirmed")
+                    receipts.append(_to_jsonable(conf))
+                except Exception as exc:
+                    receipts.append({"warn": f"confirm failed: {exc}"})
+        return {"signatures": signatures, "receipts": receipts}
+    # ---------------- HTTP helpers (Raydium Trade API) ----------------
+    def _api_get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Dict[str, Any]:
+        import requests
+        url = self.config.api_base.rstrip("/") + "/" + path.lstrip("/")
+        r = requests.get(url, params=params or {}, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            return {"data": data}
+        return data
+
+    def _api_post(self, path: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+        import requests
+        url = self.config.api_base.rstrip("/") + "/" + path.lstrip("/")
+        r = requests.post(url, json=payload, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            return {"data": data}
+        return data
+
+    # ---------------- Priority fee helper ----------------
+    def _get_priority_fee_micro_lamports(self) -> Optional[int]:
+        """Obtiene computeUnitPriceMicroLamports según tier (vh/h/m) usando la API si es posible.
+        Si falla, devuelve None y el llamante puede omitir el campo.
+        """
+        try:
+            # Endpoint esperado: /priority-fee
+            data = self._api_get("priority-fee")
+            tiers = (((data or {}).get("data") or {}).get("default") or {})
+            val = tiers.get(self.config.priority_fee_tier)
+            return int(val) if val is not None else None
+        except Exception:
+            return None
 
     def _derive_owner_from_keypair(self, keypair_path: str) -> str:
         import base58  # type: ignore
