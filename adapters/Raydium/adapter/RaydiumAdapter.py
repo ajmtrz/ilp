@@ -332,6 +332,35 @@ class RaydiumAdapter:
             return {"data": data}
         return data
 
+    # ---------------- Raydium Info API (api-v3) ----------------
+    def _info_api_get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Dict[str, Any]:
+        import requests
+        base = "https://api-v3.raydium.io"
+        url = base.rstrip("/") + "/" + path.lstrip("/")
+        r = requests.get(url, params=params or {}, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            return {"data": data}
+        return data
+
+    def get_pool_info(self, pool_id: str) -> Dict[str, Any]:
+        """Obtiene la información pública de una pool desde Raydium Info API.
+        Retorna el objeto de la pool (dict) o {} si no se encuentra.
+        """
+        if not pool_id:
+            raise ValueError("pool_id es obligatorio")
+        data = self._info_api_get("pools/info/ids", params={"ids": pool_id})
+        if isinstance(data, dict) and data.get("success") is False and data.get("message"):
+            raise RuntimeError(f"Raydium info error: {data.get('message')}")
+        payload = data.get("data") if isinstance(data, dict) else None
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict) and item.get("id") == pool_id:
+                    return item
+            return payload[0] if payload else {}
+        return payload or {}
+
     # ---------------- Priority fee helper ----------------
     def _get_priority_fee_micro_lamports(self) -> Optional[int]:
         """Obtiene computeUnitPriceMicroLamports según tier (vh/h/m) usando la API si es posible.

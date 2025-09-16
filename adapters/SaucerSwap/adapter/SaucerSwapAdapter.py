@@ -538,6 +538,21 @@ class SaucerSwapAdapter:
         data = r.json()
         return data if isinstance(data, list) else []
 
+    def get_pool_info(self, pool_id: Union[int, str]) -> Dict[str, Any]:
+        """Obtiene la información pública de una pool de SaucerSwap por poolId.
+        Ejemplo de respuesta incluye: fee, sqrtRatioX96, tickCurrent, liquidity, tokenA/B, etc.
+        """
+        import requests
+        if pool_id is None:
+            raise ValueError("pool_id es obligatorio")
+        pid = str(pool_id)
+        url = self.config.api_base.rstrip("/") + f"/v2/pools/{pid}"
+        headers = {"x-api-key": self.api_key, "Accept": "application/json", "User-Agent": "LiquidityProvider/1.0"}
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, dict) else {"data": data}
+
     def _strip_fields(self, pos: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = dict(pos)
         for key in ("token0", "token1"):
@@ -551,6 +566,8 @@ class SaucerSwapAdapter:
         return cleaned
 
     def check_position_exists_tool(self, serial: int) -> Dict[str, Any]:
+        if serial is None:
+            return {"exists": False, "details": {"reason": "missing serial"}}
         try:
             positions = self._saucerswap_positions(self.account_id)
         except Exception as exc:
