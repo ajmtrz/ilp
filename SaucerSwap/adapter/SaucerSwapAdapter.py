@@ -80,12 +80,28 @@ class SaucerSwapAdapter:
         self._router_abi_path: Optional[str] = None
         self._quoter_abi: Optional[List[Dict[str, Any]]] = None
         self._quoter_abi_path: Optional[str] = None
+        self._whbar_evm: Optional[str] = None
+        self._whbar_helper_abi: Optional[List[Dict[str, Any]]] = None
+        self._whbar_helper_error_index: Optional[Dict[bytes, Dict[str, Any]]] = None
+        self._whbar_helper_abi_path: Optional[str] = None
+        self._whbar_helper_addr: Optional[str] = None
 
         # Resolver rutas ABI desde YAML si están presentes
         try:
             abi_cfg = self.config.abi_files or {}
             self._router_abi_path = self._resolve_path_from_project_root(abi_cfg.get("swap_router"))
             self._quoter_abi_path = self._resolve_path_from_project_root(abi_cfg.get("quoter_v2"))
+            self._whbar_helper_abi_path = self._resolve_path_from_project_root(abi_cfg.get("whbar_helper"))
+        except Exception:
+            pass
+
+        # Resolver dirección del WhbarHelper desde contratos si estuviera configurado
+        try:
+            helper_hts = (self.config.contracts or {}).get("whbar_helper")
+            if helper_hts:
+                helper_evm = self._hts_to_evm(helper_hts)
+                if isinstance(helper_evm, str) and helper_evm.startswith("0x"):
+                    self._whbar_helper_addr = helper_evm
         except Exception:
             pass
 
@@ -125,6 +141,55 @@ class SaucerSwapAdapter:
         return to_checksum_address(pk.public_key.to_checksum_address())
 
     # ---------------- ABI helpers ----------------
+    def _make_client(self):
+        try:
+            from hedera import Client as HClient  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"Hedera SDK no disponible: {exc}")
+        net = (self.config.network or "mainnet").lower()
+        candidates = []
+        if net == "testnet":
+            candidates = ["for_testnet", "forTestnet"]
+        elif net == "previewnet":
+            candidates = ["for_previewnet", "forPreviewnet"]
+        else:
+            candidates = ["for_mainnet", "forMainnet"]
+        for name in candidates:
+            fn = getattr(HClient, name, None)
+            if callable(fn):
+                return fn()
+        raise RuntimeError("No se pudo crear Client para la red Hedera especificada")
+
+    def _load_hedera_private_key(self, priv_str: str):
+        """Carga una clave privada ECDSA para Hedera intentando múltiples constructores.
+        Acepta hex con o sin 0x.
+        """
+        try:
+            from hedera import PrivateKey as HPrivateKey  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"Hedera SDK no disponible: {exc}")
+        candidates = []
+        # Normaliza hex
+        p = priv_str.strip()
+        if p.startswith("0x"):
+            p_hex = p[2:]
+        else:
+            p_hex = p
+        # Orden de prueba de constructores
+        candidates.append(lambda: getattr(HPrivateKey, "fromStringECDSA", None) and HPrivateKey.fromStringECDSA(p))
+        candidates.append(lambda: HPrivateKey.fromString(p))
+        candidates.append(lambda: getattr(HPrivateKey, "fromBytesECDSA", None) and HPrivateKey.fromBytesECDSA(bytes.fromhex(p_hex)))
+        candidates.append(lambda: HPrivateKey.fromBytes(bytes.fromhex(p_hex)))
+        last_err: Optional[Exception] = None
+        for build in candidates:
+            try:
+                key = build()
+                if key is not None:
+                    return key
+            except Exception as exc:  # pragma: no cover
+                last_err = exc
+                continue
+        raise RuntimeError(f"No se pudo cargar la clave privada ECDSA: {last_err}")
     def _project_root(self) -> str:
         # .../LiquidityProvider/SaucerSwap/adapter -> go up 3 = LiquidityProvider
         return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -150,6 +215,44 @@ class SaucerSwapAdapter:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         candidate = os.path.join(base, "config", "QuoterV2.json")
         return candidate if os.path.exists(candidate) else None
+
+    def _get_router_address_evm(self) -> Optional[str]:
+        router_hts = self.config.contracts.get("swap_router", "")
+        router_evm = self._hts_to_evm(router_hts)
+        return router_evm if isinstance(router_evm, str) and router_evm.startswith("0x") else None
+
+    def _get_whbar_evm_from_router(self) -> Optional[str]:
+        if self._whbar_evm:
+            return self._whbar_evm
+        try:
+            import eth_utils  # type: ignore
+            from eth_abi import decode as abi_decode  # type: ignore
+        except Exception:
+            return None
+        self._ensure_router_abi_loaded()
+        # Intentar whbar() y WHBAR()
+        for fn in ("whbar", "WHBAR"):
+            entry = self._abi_find_function(self._router_abi, fn, []) or {}
+            selector = self._abi_selector_from_entry(entry) or eth_utils.keccak(text=f"{fn}()")[:4]
+            router = self._get_router_address_evm()
+            if not router:
+                return None
+            try:
+                res = self._call_rpc("eth_call", [{"to": router, "data": "0x" + selector.hex()}, "latest"])
+                addr = abi_decode(["address"], bytes.fromhex(res[2:]))[0]
+                addr_str = addr if isinstance(addr, str) else None
+                # Algunos decoders retornan bytes20; forzamos a 0x...
+                if not addr_str or not isinstance(addr_str, str) or not addr_str.startswith("0x"):
+                    try:
+                        addr_str = "0x" + bytes(addr).hex()  # type: ignore
+                    except Exception:
+                        pass
+                if addr_str and addr_str.startswith("0x"):
+                    self._whbar_evm = addr_str
+                    return self._whbar_evm
+            except Exception:
+                continue
+        return None
 
     def _ensure_router_abi_loaded(self) -> None:
         if self._router_abi is not None and self._router_error_index is not None:
@@ -189,6 +292,150 @@ class SaucerSwapAdapter:
         except Exception as exc:
             self.logger.warning("No se pudo cargar Quoter ABI: %s", exc)
             self._quoter_abi = []
+
+    def _get_whbar_helper_abi_path(self) -> Optional[str]:
+        if self._whbar_helper_abi_path and os.path.exists(self._whbar_helper_abi_path):
+            return self._whbar_helper_abi_path
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(base, "config", "abi", "WhbarHelper.json")
+        return candidate if os.path.exists(candidate) else None
+
+    def _ensure_whbar_helper_abi_loaded(self) -> None:
+        if self._whbar_helper_abi is not None and self._whbar_helper_error_index is not None:
+            return
+        path = self._get_whbar_helper_abi_path()
+        if not path:
+            self._whbar_helper_abi = []
+            self._whbar_helper_error_index = {}
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._whbar_helper_abi = json.load(f)
+        except Exception as exc:
+            self.logger.warning("No se pudo cargar WhbarHelper ABI: %s", exc)
+            self._whbar_helper_abi = []
+        # Construir índice de errores personalizados
+        self._whbar_helper_error_index = {}
+        try:
+            import eth_utils  # type: ignore
+        except Exception:
+            return
+        for entry in self._whbar_helper_abi or []:
+            if entry.get("type") == "error":
+                name = entry.get("name")
+                inputs = entry.get("inputs", [])
+                types = ",".join(i.get("type") for i in inputs)
+                sig = f"{name}({types})"
+                selector = eth_utils.keccak(text=sig)[:4]
+                self._whbar_helper_error_index[bytes(selector)] = {"name": name, "inputs": inputs}
+
+    def _get_whbar_helper_address(self) -> Optional[str]:
+        # Si no está en config, intentamos leer desde el router si expusiera helper (no estándar)
+        return self._whbar_helper_addr
+
+    def _whbar_helper_token_address(self) -> Optional[str]:
+        """Llama a whbarToken() en el helper para obtener el address del token WHBAR."""
+        try:
+            import eth_utils  # type: ignore
+            from eth_abi import decode as abi_decode  # type: ignore
+        except Exception:
+            return None
+        self._ensure_whbar_helper_abi_loaded()
+        helper = self._get_whbar_helper_address()
+        if not helper:
+            return None
+        entry = self._abi_find_function(self._whbar_helper_abi, "whbarToken", []) or {}
+        selector = self._abi_selector_from_entry(entry)
+        if selector is None:
+            selector = eth_utils.keccak(text="whbarToken()")[:4]
+        try:
+            res = self._call_rpc("eth_call", [{"to": helper, "data": "0x" + selector.hex()}, "latest"])
+            addr = abi_decode(["address"], bytes.fromhex(res[2:]))[0]
+            return addr if isinstance(addr, str) else None
+        except Exception:
+            return None
+
+    def _erc20_allowance(self, token_addr: str, owner: str, spender: str) -> Optional[int]:
+        try:
+            import eth_utils  # type: ignore
+            from eth_abi import encode as abi_encode, decode as abi_decode  # type: ignore
+        except Exception:
+            return None
+        sel = eth_utils.keccak(text="allowance(address,address)")[:4]
+        calldata = sel + abi_encode(["address", "address"], [owner, spender])
+        try:
+            res = self._call_rpc("eth_call", [{"to": token_addr, "data": "0x" + calldata.hex()}, "latest"])
+            val = abi_decode(["uint256"], bytes.fromhex(res[2:]))[0]
+            return int(val)
+        except Exception:
+            return None
+
+    def _erc20_balance_of(self, token_addr: str, owner: str) -> Optional[int]:
+        try:
+            import eth_utils  # type: ignore
+            from eth_abi import encode as abi_encode, decode as abi_decode  # type: ignore
+        except Exception:
+            return None
+        sel = eth_utils.keccak(text="balanceOf(address)")[:4]
+        calldata = sel + abi_encode(["address"], [owner])
+        try:
+            res = self._call_rpc("eth_call", [{"to": token_addr, "data": "0x" + calldata.hex()}, "latest"])
+            bal = abi_decode(["uint256"], bytes.fromhex(res[2:]))[0]
+            return int(bal)
+        except Exception:
+            return None
+
+    def _whbar_sweep_unwrap(self, owner: str) -> Optional[Dict[str, Any]]:
+        """Si el usuario tiene saldo WHBAR > 0, intenta aprobar helper y ejecutar unwrapWhbar(balance)."""
+        try:
+            import eth_utils  # type: ignore
+            from eth_abi import encode as abi_encode  # type: ignore
+        except Exception:
+            return {"error": "faltan dependencias eth_utils/eth_abi"}
+        helper = self._get_whbar_helper_address()
+        if not helper:
+            return {"skipped": True, "reason": "whbar_helper no configurado"}
+        # Obtener token WHBAR desde helper
+        token_addr = self._whbar_helper_token_address()
+        if not token_addr:
+            return {"skipped": True, "reason": "whbarToken no accesible"}
+        # Balance
+        bal = self._erc20_balance_of(token_addr, owner)
+        if not bal or bal <= 0:
+            return {"skipped": True, "reason": "saldo WHBAR = 0"}
+        # Approve HTS (solo SDK) si allowance < bal
+        allowance = self._erc20_allowance(token_addr, owner, helper) or 0
+        if allowance < bal:
+            token_id_hts = self._evm_to_hts(token_addr) or ""
+            spender_hts = self._evm_to_hts(helper) or ""
+            if not (token_id_hts and spender_hts):
+                return {"skipped": True, "reason": "no se pudo derivar HTS ids para approve"}
+            self.approve_hts_execute(token_id=token_id_hts, spender_contract_id=spender_hts, amount=(1 << 63) - 1)
+            # Esperar a que se refleje y re-chequear varias veces
+            try:
+                import time
+                for _ in range(20):
+                    time.sleep(1)
+                    allowance = self._erc20_allowance(token_addr, owner, helper) or 0
+                    if allowance >= bal:
+                        break
+            except Exception:
+                pass
+        # Si tras aprobaciones la allowance sigue insuficiente, no ejecutar unwrap para evitar gasto inútil
+        if allowance < bal:
+            return {
+                "skipped": True,
+                "reason": "allowance insuficiente tras approve HTS",
+                "allowance": {"current": allowance, "needed": int(bal)},
+            }
+        # Llamar unwrapWhbar(uint256)
+        self._ensure_whbar_helper_abi_loaded()
+        entry = self._abi_find_function(self._whbar_helper_abi, "unwrapWhbar", ["uint256"]) or {}
+        selector = self._abi_selector_from_entry(entry) or eth_utils.keccak(text="unwrapWhbar(uint256)")[:4]
+        calldata = selector + abi_encode(["uint256"], [int(bal)])
+        txu = {"from": owner, "to": helper, "data": "0x" + calldata.hex()}
+        res = self.send_transaction(txu, wait=True)
+        return {"executed": True, "tx": res, "amount": bal}
 
     def _abi_find_function(self, abi_list: Optional[List[Dict[str, Any]]], name: str, input_types: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         if not abi_list:
@@ -260,11 +507,22 @@ class SaucerSwapAdapter:
                 return {"type": "Panic", "code": int(code)}
             except Exception:
                 return {"type": "Panic", "raw": data_hex}
-        # Custom errors
+        # Custom errors: Router
         self._ensure_router_abi_loaded()
-        idx = self._router_error_index or {}
-        if selector in idx:
-            err = idx[selector]
+        idx_router = self._router_error_index or {}
+        if selector in idx_router:
+            err = idx_router[selector]
+            arg_types = [inp.get("type") for inp in err["inputs"]]
+            try:
+                values = abi_decode(arg_types, data[4:]) if arg_types else []
+                return {"type": err["name"], "args": [int(v) if hasattr(v, "__int__") else v for v in values]}
+            except Exception:
+                return {"type": err["name"], "raw": data_hex}
+        # Custom errors: WhbarHelper
+        self._ensure_whbar_helper_abi_loaded()
+        idx_helper = self._whbar_helper_error_index or {}
+        if selector in idx_helper:
+            err = idx_helper[selector]
             arg_types = [inp.get("type") for inp in err["inputs"]]
             try:
                 values = abi_decode(arg_types, data[4:]) if arg_types else []
@@ -348,6 +606,18 @@ class SaucerSwapAdapter:
         evm_int = (shard << (8*16)) | (realm << (8*8)) | num
         return "0x" + evm_int.to_bytes(20, byteorder="big").hex()
 
+    def _evm_to_hts(self, evm_addr: str) -> Optional[str]:
+        """Convierte 0x.. (20 bytes) a formato HTS shard.realm.num, si aplica."""
+        try:
+            hexstr = evm_addr.lower().replace("0x", "")
+            evm_int = int(hexstr, 16)
+            shard = evm_int >> (8 * 16)
+            realm = (evm_int >> (8 * 8)) & ((1 << 64) - 1)
+            num = evm_int & ((1 << 64) - 1)
+            return f"{shard}.{realm}.{num}"
+        except Exception:
+            return None
+
     def _encode_path_v2(self, tokens: List[str], fees_bps: List[int]) -> bytes:
         if len(tokens) < 2 or len(fees_bps) != len(tokens) - 1:
             raise ValueError("path inválido: tokens y fees no casan")
@@ -371,12 +641,13 @@ class SaucerSwapAdapter:
         import eth_utils  # type: ignore
 
         route_hops = route_hops or []
-        whbar = self.config.contracts.get("whbar")
+        # WHBAR se resuelve del router ABI, no del YAML
+        whbar = self._get_whbar_evm_from_router()
         def norm(t: str) -> str:
             if t.upper() == "HBAR":
-                if not whbar:
-                    raise ValueError("whbar no configurado")
-                return self._hts_to_evm(whbar)
+                if not whbar or not whbar.startswith("0x"):
+                    raise ValueError("WHBAR no disponible desde router")
+                return whbar
             return self._hts_to_evm(t)
 
         tokens = [norm(token_in)] + [norm(t) for (t, _f) in route_hops] + [norm(token_out)]
@@ -688,6 +959,14 @@ class SaucerSwapAdapter:
             txs["value"] = prep["value"]
         res_s = self.send_transaction(txs, wait=wait)
         results["steps"].append({"swap": res_s})
+        # 3) Barrido WHBAR si quedara en el usuario (post-swap residual)
+        try:
+            owner = prep.get("from") or self.evm_address
+            sweep = self._whbar_sweep_unwrap(owner)
+            if sweep and (sweep.get("executed") or sweep.get("skipped")):
+                results["steps"].append({"whbar_sweep": sweep})
+        except Exception as exc:
+            results["steps"].append({"whbar_sweep": {"error": str(exc)}})
         return results
 
     # ---------------- Allowance (ERC20.approve) ----------------
@@ -765,16 +1044,11 @@ class SaucerSwapAdapter:
             return {"executed": False, "error": f"error leyendo keyfile: {exc}"}
 
         # Cliente según red
-        net = (self.config.network or "mainnet").lower()
-        if net == "testnet":
-            client = HClient.for_testnet()
-        elif net == "previewnet":
-            client = HClient.for_previewnet()
-        else:
-            client = HClient.for_mainnet()
+        client = self._make_client()
+        client = self._make_client()
 
         operator_id = HAccountId.fromString(acct)
-        operator_key = HPrivateKey.fromString(priv_str)
+        operator_key = self._load_hedera_private_key(priv_str)
         client.setOperator(operator_id, operator_key)
 
         # Normalizar tokens y filtrar ya asociados
@@ -805,6 +1079,49 @@ class SaucerSwapAdapter:
                 receipts.append({"batch": batch, "error": str(exc)})
 
         return {"executed": True, "account_id": acct, "receipts": receipts}
+
+    # ---------------- HTS Approve (Hedera SDK ejecución) ----------------
+    def approve_hts_execute(self, token_id: str, spender_contract_id: str, amount: int = (1 << 63) - 1, account_id: Optional[str] = None) -> Dict[str, Any]:
+        """Aprueba vía Hedera SDK (AccountAllowanceApproveTransaction) un allowance HTS al spender.
+        Por defecto usa amount alto (signed long max) suficiente para whbar helper.
+        """
+        try:
+            from hedera import AccountId as HAccountId, PrivateKey as HPrivateKey, Client as HClient
+            from hedera import TokenId as HTokenId, AccountAllowanceApproveTransaction
+        except Exception as exc:
+            return {"executed": False, "error": f"Hedera SDK no disponible: {exc}"}
+
+        acct = account_id or self.account_id
+        # Cargar clave del archivo
+        try:
+            with open(os.path.expanduser(self.config.private_key_path), "r", encoding="utf-8") as f:
+                key_json = json.load(f)
+            priv_str = key_json.get("private_key") or key_json.get("operator_private_key") or key_json.get("privkey")
+            if not priv_str:
+                return {"executed": False, "error": "private_key no encontrado en private_key_path"}
+        except Exception as exc:
+            return {"executed": False, "error": f"error leyendo keyfile: {exc}"}
+
+        client = self._make_client()
+
+        operator_id = HAccountId.fromString(acct)
+        operator_key = self._load_hedera_private_key(priv_str)
+        client.setOperator(operator_id, operator_key)
+
+        try:
+            tx = AccountAllowanceApproveTransaction()
+            tx.approveTokenAllowance(
+                HTokenId.fromString(token_id),
+                operator_id,  # owner (tu cuenta)
+                HAccountId.fromString(spender_contract_id),  # spender (WhbarHelper)
+                int(amount),
+            )
+            tx.freezeWith(client)
+            resp = tx.sign(operator_key).execute(client)
+            rec = resp.getReceipt(client)
+            return {"executed": True, "status": str(rec.status)}
+        except Exception as exc:
+            return {"executed": False, "error": str(exc)}
 
     # ---------------- Allowance check (read-only) ----------------
     def allowance_check(self, token_in: str, owner_evm: Optional[str] = None, spender: Optional[str] = None) -> Dict[str, Any]:

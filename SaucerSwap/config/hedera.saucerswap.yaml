@@ -10,7 +10,8 @@ saucerswap:
   contracts:
     quoter_v2: 0.0.3949424
     swap_router: 0.0.3949434
-    whbar: 0.0.1456986
+    whbar_helper: 0.0.5808826
   abi_files:
-    quoter_v2: LiquidityProvider/SaucerSwap/config/QuoterV2.json
-    swap_router: LiquidityProvider/SaucerSwap/config/SwapRouter.json
+    quoter_v2: LiquidityProvider/SaucerSwap/config/abi/QuoterV2.json
+    swap_router: LiquidityProvider/SaucerSwap/config/abi/SwapRouter.json
+    whbar_helper: LiquidityProvider/SaucerSwap/config/abi/WhbarHelper.json
