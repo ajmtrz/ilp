@@ -3,8 +3,8 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from dotenv import load_dotenv
 import yaml
+from adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
 
 from .ClmmDecoder import ClmmDecoder
 
@@ -40,14 +40,12 @@ class EndpointRotator:
 
 class RaydiumAdapter:
     def __init__(self, config_path: str):
-        root_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", ".env")
-        load_dotenv(dotenv_path=os.path.abspath(root_env))
-        log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
-        level = getattr(logging, log_level_str, logging.INFO)
-        logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        project_root = get_project_root(__file__)
+        load_project_env(project_root)
+        configure_logging()
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        config_path_abs = os.path.abspath(config_path)
+        config_path_abs = resolve_from_root(project_root, config_path)
         with open(config_path_abs, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
 
@@ -416,7 +414,7 @@ class RaydiumAdapter:
             wallet_path=self.config.keypair_path,
         ) or {}
 
-    def check_position_exists_tool(self, position_nft_mint: str, pool_address: Optional[str] = None) -> Dict[str, Any]:
+    def check_position_exists_tool(self, position_nft_mint: str) -> Dict[str, Any]:
         if not position_nft_mint:
             return {"exists": False, "details": {"reason": "missing position_nft_mint"}}
         try:

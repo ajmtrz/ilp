@@ -3,8 +3,8 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
-from dotenv import load_dotenv
 import yaml
+from adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
 
 
 @dataclass
@@ -35,18 +35,16 @@ class EndpointRotator:
 
 class SaucerSwapAdapter:
     def __init__(self, config_path: str):
-        root_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", ".env")
-        load_dotenv(dotenv_path=os.path.abspath(root_env))
-        log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
-        level = getattr(logging, log_level_str, logging.INFO)
-        logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        project_root = get_project_root(__file__)
+        load_project_env(project_root)
+        configure_logging()
         self.logger = logging.getLogger(self.__class__.__name__)
 
         self.api_key = os.getenv("SAUCER_API")
         if not self.api_key:
             raise RuntimeError("SAUCER_API no configurada en .env")
 
-        config_path_abs = os.path.abspath(config_path)
+        config_path_abs = resolve_from_root(project_root, config_path)
         with open(config_path_abs, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
 
@@ -191,8 +189,7 @@ class SaucerSwapAdapter:
                 continue
         raise RuntimeError(f"No se pudo cargar la clave privada ECDSA: {last_err}")
     def _project_root(self) -> str:
-        # .../LiquidityProvider/SaucerSwap/adapter -> go up 3 = LiquidityProvider
-        return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return get_project_root(__file__)
 
     def _resolve_path_from_project_root(self, path: Optional[str]) -> Optional[str]:
         if not path:
@@ -554,8 +551,6 @@ class SaucerSwapAdapter:
         return cleaned
 
     def check_position_exists_tool(self, serial: int) -> Dict[str, Any]:
-        if serial is None:
-            return {"exists": False, "details": {"reason": "missing serial"}}
         try:
             positions = self._saucerswap_positions(self.account_id)
         except Exception as exc:
@@ -687,22 +682,39 @@ class SaucerSwapAdapter:
             "initializedTicksCrossedList": [int(x) for x in decoded[2]],
             "gasEstimate": int(decoded[3]),
             "path": "0x" + (path.hex() if kind == "exact_in" else path_rev.hex()),
+            # metadata necesaria para swap_prepare (comportamiento homogéneo con Raydium)
+            "kind": kind,
+            "tokenInRaw": token_in,
+            "tokenOutRaw": token_out,
+            "requestedAmount": int(amount),
+            "feeBps": int(fee_bps),
+            "routeHops": route_hops or [],
         }
 
     # ---------------- Swap (preparación) ----------------
-    def swap_prepare(self, token_in: str, token_out: str, amount: int, kind: str, fee_bps: int, slippage_bps: int = 50, deadline_s: int = 300, route_hops: Optional[List[Tuple[str,int]]] = None, recipient_evm: Optional[str] = None) -> Dict[str, Any]:
+    def swap_prepare(self, swap_quote: Dict[str, Any], slippage_bps: int = 50, deadline_s: int = 300, recipient_evm: Optional[str] = None) -> Dict[str, Any]:
         from eth_abi import encode as abi_encode  # type: ignore
         import eth_utils  # type: ignore
         import time
 
-        quote = self.get_quote(token_in, token_out, amount, kind, fee_bps, route_hops)
-        amount_out = quote.get("amountOut")
-        amount_in = quote.get("amountIn")
-        path_hex = quote["path"]
+        if not isinstance(swap_quote, dict):
+            raise ValueError("swap_quote inválido: se espera el resultado de get_quote")
+        kind = swap_quote.get("kind")
+        if kind not in ("exact_in", "exact_out"):
+            raise ValueError("swap_quote.kind debe ser 'exact_in' o 'exact_out'")
+        path_hex = swap_quote.get("path")
+        if not isinstance(path_hex, str) or not path_hex.startswith("0x"):
+            raise ValueError("swap_quote.path inválido")
 
-        whbar = self.config.contracts.get("whbar")
-        is_hbar_in = token_in.upper() == "HBAR"
-        is_hbar_out = token_out.upper() == "HBAR"
+        # Cantidades y tokens según el tipo de cotización
+        requested_amount = int(swap_quote.get("requestedAmount"))
+        amount_out = swap_quote.get("amountOut")
+        amount_in = swap_quote.get("amountIn")
+        token_in_raw = str(swap_quote.get("tokenInRaw"))
+        token_out_raw = str(swap_quote.get("tokenOutRaw"))
+
+        is_hbar_in = token_in_raw.upper() == "HBAR"
+        is_hbar_out = token_out_raw.upper() == "HBAR"
 
         sender = recipient_evm or self.evm_address
         recipient = recipient_evm or sender
@@ -711,8 +723,12 @@ class SaucerSwapAdapter:
             raise ValueError("swap_router no configurado correctamente")
 
         if kind == "exact_in":
+            if amount_out is None:
+                raise ValueError("swap_quote.amountOut ausente para exact_in")
             min_out = (int(amount_out) * (10000 - slippage_bps)) // 10000
         else:
+            if amount_in is None:
+                raise ValueError("swap_quote.amountIn ausente para exact_out")
             max_in = (int(amount_in) * (10000 + slippage_bps)) // 10000
 
         value = 0
@@ -723,13 +739,13 @@ class SaucerSwapAdapter:
         associated: Optional[bool] = None
         notes: List[str] = []
         if not is_hbar_out:
-            # Consideramos que el usuario pasa token_out en formato HTS 0.0.x para poder consultar asociación
-            if isinstance(token_out, str) and token_out.count(".") == 2:
+            # Usamos token_out_raw (HTS esperado si no es HBAR) para asociación
+            if isinstance(token_out_raw, str) and token_out_raw.count(".") == 2:
                 try:
-                    chk = self.check_associated(token_out)
+                    chk = self.check_associated(token_out_raw)
                     associated = bool(chk.get("associated"))
                     if not chk.get("associated"):
-                        assoc_res = self.associate_execute(token_out)
+                        assoc_res = self.associate_execute(token_out_raw)
                         association = assoc_res
                         if not assoc_res.get("executed"):
                             notes.append(f"auto-association failed: {assoc_res}")
@@ -744,15 +760,15 @@ class SaucerSwapAdapter:
         allowance_needed: Optional[int] = None
         if not is_hbar_in:
             try:
-                needed = max_in if kind == "exact_out" else amount
-                alw = self.allowance_check(token_in)
+                needed = (max_in if kind == "exact_out" else requested_amount)
+                alw = self.allowance_check(token_in_raw)
                 current = int(alw.get("allowance", 0))
                 allowance_current = current
                 allowance_needed = int(needed)
                 if current < int(needed):
                     # MAX_UINT256
                     max_uint = (1 << 256) - 1
-                    approve_tx = self.approve_prepare(token_in, max_uint)
+                    approve_tx = self.approve_prepare(token_in_raw, max_uint)
                     notes.append("approve(MAX_UINT256) preparado por allowance insuficiente")
             except Exception as exc:
                 notes.append(f"auto-approve error: {exc}")
@@ -767,7 +783,7 @@ class SaucerSwapAdapter:
                 bytes.fromhex(path_hex[2:]),
                 recipient,
                 int(deadline_ts),
-                int(amount),
+                int(requested_amount),
                 int(min_out),
             )
             exact_calldata = exact_sel + abi_encode(["(bytes,address,uint256,uint256,uint256)"], [args_tuple])
@@ -778,7 +794,7 @@ class SaucerSwapAdapter:
                 inner = [exact_calldata, refund_sel]
                 tx_data = multicall_sel + abi_encode(["bytes[]"], [inner])
                 # amount está en tinybars (8 decimales). JSON-RPC espera wei (1 tinybar = 1e10 wei)
-                value = int(amount) * (10 ** 10)
+                value = int(requested_amount) * (10 ** 10)
             elif is_hbar_out:
                 # Token -> HBAR: unwrap WHBAR to HBAR after swap y reembolsa residual de HBAR
                 unwrap_sel = eth_utils.keccak(text="unwrapWHBAR(uint256,address)")[:4]
@@ -798,7 +814,7 @@ class SaucerSwapAdapter:
                 bytes.fromhex(path_hex[2:]),
                 recipient,
                 int(deadline_ts),
-                int(amount),
+                int(requested_amount),
                 int(max_in),
             )
             exacto_calldata = exacto_sel + abi_encode(["(bytes,address,uint256,uint256,uint256)"], [args_tuple])
@@ -838,7 +854,7 @@ class SaucerSwapAdapter:
             "data": "0x" + tx_data.hex(),
             "value": value,
             "gasEstimate": gas_estimate,
-            "quote": quote,
+            "quote": swap_quote,
             "from": sender,
             "notes": notes,
             "association": association,

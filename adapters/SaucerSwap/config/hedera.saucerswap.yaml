@@ -12,6 +12,6 @@ saucerswap:
     swap_router: 0.0.3949434
     whbar_helper: 0.0.5808826
   abi_files:
-    quoter_v2: LiquidityProvider/SaucerSwap/config/abi/QuoterV2.json
-    swap_router: LiquidityProvider/SaucerSwap/config/abi/SwapRouter.json
-    whbar_helper: LiquidityProvider/SaucerSwap/config/abi/WhbarHelper.json
+    quoter_v2: adapters/SaucerSwap/config/abi/QuoterV2.json
+    swap_router: adapters/SaucerSwap/config/abi/SwapRouter.json
+    whbar_helper: adapters/SaucerSwap/config/abi/WhbarHelper.json
