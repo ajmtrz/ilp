@@ -83,6 +83,24 @@ class SaucerSwapAdapter:
         self._whbar_helper_error_index: Optional[Dict[bytes, Dict[str, Any]]] = None
         self._whbar_helper_abi_path: Optional[str] = None
         self._whbar_helper_addr: Optional[str] = None
+        # Nonfungible Position Manager (NPM)
+        self._npm_abi: Optional[List[Dict[str, Any]]] = None
+        self._npm_abi_path: Optional[str] = None
+        self._npm_addr: Optional[str] = None
+        self._npm_error_index: Optional[Dict[bytes, Dict[str, Any]]] = None
+        # LP NFT HTS id (para asociación previa al mint)
+        self._lp_nft_id: Optional[str] = None
+        # Factory / Pool / TickLens ABIs
+        self._factory_abi: Optional[List[Dict[str, Any]]] = None
+        self._factory_abi_path: Optional[str] = None
+        self._pool_abi: Optional[List[Dict[str, Any]]] = None
+        self._pool_abi_path: Optional[str] = None
+        self._tick_lens_abi: Optional[List[Dict[str, Any]]] = None
+        self._tick_lens_abi_path: Optional[str] = None
+        # MasterChef (conversion tinycents -> tinybars y otros parámetros)
+        self._master_chef_abi: Optional[List[Dict[str, Any]]] = None
+        self._master_chef_abi_path: Optional[str] = None
+        self._master_chef_addr: Optional[str] = None
 
         # Resolver rutas ABI desde YAML si están presentes
         try:
@@ -90,6 +108,11 @@ class SaucerSwapAdapter:
             self._router_abi_path = self._resolve_path_from_project_root(abi_cfg.get("swap_router"))
             self._quoter_abi_path = self._resolve_path_from_project_root(abi_cfg.get("quoter_v2"))
             self._whbar_helper_abi_path = self._resolve_path_from_project_root(abi_cfg.get("whbar_helper"))
+            self._npm_abi_path = self._resolve_path_from_project_root(abi_cfg.get("nonfungible_position_manager"))
+            self._factory_abi_path = self._resolve_path_from_project_root(abi_cfg.get("factory_v2"))
+            self._pool_abi_path = self._resolve_path_from_project_root(abi_cfg.get("pool"))
+            self._tick_lens_abi_path = self._resolve_path_from_project_root(abi_cfg.get("tick_lens"))
+            self._master_chef_abi_path = self._resolve_path_from_project_root(abi_cfg.get("master_chef"))
         except Exception:
             pass
 
@@ -102,6 +125,36 @@ class SaucerSwapAdapter:
                     self._whbar_helper_addr = helper_evm
         except Exception:
             pass
+
+        # Resolver dirección del NPM y LP NFT id si estuvieran configurados
+        try:
+            npm_hts = (self.config.contracts or {}).get("nonfungible_position_manager")
+            if npm_hts:
+                npm_evm = self._hts_to_evm(npm_hts)
+                if isinstance(npm_evm, str) and npm_evm.startswith("0x"):
+                    self._npm_addr = npm_evm
+            self._lp_nft_id = (self.config.contracts or {}).get("lp_nft_id")
+        except Exception:
+            pass
+
+        # Resolver dirección de Factory V2 si estuviera configurada (para mintFee)
+        try:
+            self._factory_hts: Optional[str] = (self.config.contracts or {}).get("factory_v2")
+            self._factory_evm: Optional[str] = None
+            if self._factory_hts:
+                evm = self._hts_to_evm(self._factory_hts)
+                if isinstance(evm, str) and evm.startswith("0x"):
+                    self._factory_evm = evm
+            # MasterChef address
+            mc_hts = (self.config.contracts or {}).get("master_chef")
+            if mc_hts:
+                evm = self._hts_to_evm(mc_hts)
+                if isinstance(evm, str) and evm.startswith("0x"):
+                    self._master_chef_addr = evm
+        except Exception:
+            self._factory_hts = None
+            self._factory_evm = None
+            self._master_chef_addr = None
 
     # ---------------- Claves/EVM helpers ----------------
     def _extract_private_key_hex(self, key_json: Dict[str, Any]) -> str:
@@ -326,6 +379,50 @@ class SaucerSwapAdapter:
                 selector = eth_utils.keccak(text=sig)[:4]
                 self._whbar_helper_error_index[bytes(selector)] = {"name": name, "inputs": inputs}
 
+    # ---------------- NonfungiblePositionManager (NPM) ABI ----------------
+    def _get_npm_abi_path(self) -> Optional[str]:
+        if self._npm_abi_path and os.path.exists(self._npm_abi_path):
+            return self._npm_abi_path
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(base, "config", "abi", "NonfungiblePositionManager.json")
+        return candidate if os.path.exists(candidate) else None
+
+    def _ensure_npm_abi_loaded(self) -> None:
+        if self._npm_abi is not None and self._npm_error_index is not None:
+            return
+        path = self._get_npm_abi_path()
+        if not path:
+            self._npm_abi = []
+            self._npm_error_index = {}
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._npm_abi = json.load(f)
+        except Exception as exc:
+            self.logger.warning("No se pudo cargar NPM ABI: %s", exc)
+            self._npm_abi = []
+        # Construir índice de errores del NPM
+        self._npm_error_index = {}
+        try:
+            import eth_utils  # type: ignore
+        except Exception:
+            return
+        for entry in self._npm_abi or []:
+            if entry.get("type") == "error":
+                name = entry.get("name")
+                inputs = entry.get("inputs", [])
+                types = ",".join(i.get("type") for i in inputs)
+                sig = f"{name}({types})"
+                selector = eth_utils.keccak(text=sig)[:4]
+                self._npm_error_index[bytes(selector)] = {"name": name, "inputs": inputs}
+
+    def _get_npm_address_evm(self) -> Optional[str]:
+        return self._npm_addr
+
+    def _whbar_token_id(self) -> Optional[str]:
+        evm = self._get_whbar_evm_from_router()
+        return self._evm_to_hts(evm) if evm else None
+
     def _get_whbar_helper_address(self) -> Optional[str]:
         # Si no está en config, intentamos leer desde el router si expusiera helper (no estándar)
         return self._whbar_helper_addr
@@ -381,6 +478,39 @@ class SaucerSwapAdapter:
             return int(bal)
         except Exception:
             return None
+
+    def get_balance(self, token_id_or_hbar: str) -> Dict[str, Any]:
+        """Retorna el balance de la wallet para un token HTS (0.0.x) o HBAR.
+        - HBAR: usa Mirror Node account info.
+        - HTS (fungible): llama balanceOf vía ERC20 (JSON-RPC) con dirección EVM del token.
+        Devuelve {token: ..., raw: int, decimals?: int}.
+        """
+        if isinstance(token_id_or_hbar, str) and token_id_or_hbar.upper() == "HBAR":
+            # Mirror Node: /accounts/{id}
+            import requests
+            try:
+                url = f"https://mainnet.mirrornode.hedera.com/api/v1/accounts/{self.account_id}"
+                r = requests.get(url, timeout=15)
+                r.raise_for_status()
+                data = r.json()
+                # balance en tinybar
+                tb = int(((data or {}).get("balance") or {}).get("balance", 0))
+                return {"token": "HBAR", "raw": tb, "decimals": 8}
+            except Exception as exc:
+                return {"token": "HBAR", "error": str(exc)}
+        # HTS token
+        evm = self._hts_to_evm(token_id_or_hbar)
+        if not isinstance(evm, str) or not evm.startswith("0x"):
+            return {"token": token_id_or_hbar, "error": "token inválido"}
+        bal = self._erc20_balance_of(evm, self.evm_address)
+        return {"token": token_id_or_hbar, "raw": int(bal or 0)}
+
+    def get_balances(self, tokens: List[str]) -> Dict[str, Any]:
+        """Retorna balances para una lista de tokens (HTS o HBAR)."""
+        out: Dict[str, Any] = {}
+        for t in tokens:
+            out[t] = self.get_balance(t)
+        return out
 
     def _whbar_sweep_unwrap(self, owner: str) -> Optional[Dict[str, Any]]:
         """Si el usuario tiene saldo WHBAR > 0, intenta aprobar helper y ejecutar unwrapWhbar(balance)."""
@@ -484,6 +614,10 @@ class SaucerSwapAdapter:
         except Exception:
             return None
         if len(data) < 4:
+            # Hedera a veces devuelve códigos cortos (p.ej. 0x3078)
+            short = data_hex.lower()
+            if short == "0x3078":
+                return {"type": "HederaStatus", "code": "0x3078"}
             return None
         selector = data[:4]
         try:
@@ -526,6 +660,17 @@ class SaucerSwapAdapter:
                 return {"type": err["name"], "args": [int(v) if hasattr(v, "__int__") else v for v in values]}
             except Exception:
                 return {"type": err["name"], "raw": data_hex}
+        # Custom errors: NonfungiblePositionManager
+        self._ensure_npm_abi_loaded()
+        idx_npm = self._npm_error_index or {}
+        if selector in idx_npm:
+            err = idx_npm[selector]
+            arg_types = [inp.get("type") for inp in err["inputs"]]
+            try:
+                values = abi_decode(arg_types, data[4:]) if arg_types else []
+                return {"type": err["name"], "args": [int(v) if hasattr(v, "__int__") else v for v in values]}
+            except Exception:
+                return {"type": err["name"], "raw": data_hex}
         return {"type": "Unknown", "raw": data_hex}
 
     # ---------------- REST posiciones ----------------
@@ -537,6 +682,830 @@ class SaucerSwapAdapter:
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, list) else []
+
+    # ---------------- Pools helpers (REST/on-chain) ----------------
+    def pool_exists(self, tokenA: str, tokenB: str, fee_bps: int) -> Dict[str, Any]:
+        """Comprueba existencia de una pool V2 por tokens HTS/HBAR y fee (bps) usando REST.
+        - Si token es "HBAR", usa WHBAR token id como equivalente.
+        Retorna {exists: bool, poolId?: int}.
+        """
+        import requests
+        # Normalizar a HTS ids
+        def norm_token(t: str) -> str:
+            if isinstance(t, str) and t.upper() == "HBAR":
+                return self._whbar_token_id() or ""
+            return t
+        a = norm_token(tokenA)
+        b = norm_token(tokenB)
+        if not (a and b):
+            return {"exists": False, "reason": "tokens no válidos"}
+        url = self.config.api_base.rstrip("/") + "/v2/pools"
+        headers = {"x-api-key": self.api_key, "Accept": "application/json", "User-Agent": "LiquidityProvider/1.0"}
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        pools = r.json()
+        if not isinstance(pools, list):
+            return {"exists": False, "reason": "respuesta inesperada"}
+        target = {a, b}
+        for p in pools:
+            try:
+                pa = (p.get("tokenA") or {}).get("id")
+                pb = (p.get("tokenB") or {}).get("id")
+                fee = int(p.get("fee"))
+                if fee == int(fee_bps) and {pa, pb} == target:
+                    return {"exists": True, "poolId": p.get("id"), "contractId": p.get("contractId")}
+            except Exception:
+                continue
+        return {"exists": False}
+
+    def get_pool_ratio(self, pool_id: int) -> Dict[str, Any]:
+        """Obtiene sqrtRatioX96, tickCurrent y liquidez desde REST de una pool.
+        Retorna {sqrtRatioX96, tickCurrent, liquidity}.
+        """
+        info = self.get_pool_info(pool_id)
+        return {
+            "sqrtRatioX96": info.get("sqrtRatioX96"),
+            "tickCurrent": info.get("tickCurrent"),
+            "liquidity": info.get("liquidity"),
+        }
+
+    def get_mint_fee(self) -> Dict[str, Any]:
+        # 1) Obtener tinycent on-chain (Factory.mintFee() o MasterChef.depositFee())
+        try:
+            import eth_utils  # type: ignore
+            from eth_abi import decode as abi_decode  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"Dependencias faltantes para fee: {exc}")
+
+        if not (self._factory_evm or self._master_chef_addr):
+            raise RuntimeError("factory_v2 o master_chef deben estar configurados en YAML")
+
+        tinycent = None
+        # Factory.mintFee() -> tinycent
+        if self._factory_evm:
+            try:
+                sel_mf = eth_utils.keccak(text="mintFee()")[:4]
+                res_mf = self._call_rpc("eth_call", [{"to": self._factory_evm, "data": "0x" + sel_mf.hex()}, "latest"])
+                tinycent = int(abi_decode(["uint256"], bytes.fromhex(res_mf[2:]))[0])
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug("get_mint_fee: factory.mintFee tinycent=%s", tinycent)
+            except Exception:
+                tinycent = None
+
+        # Fallback interno: MasterChef.depositFee() -> tinycent
+        if tinycent is None and self._master_chef_addr:
+            sel_df = eth_utils.keccak(text="depositFee()")[:4]
+            res_df = self._call_rpc("eth_call", [{"to": self._master_chef_addr, "data": "0x" + sel_df.hex()}, "latest"])
+            tinycent = int(abi_decode(["uint256"], bytes.fromhex(res_df[2:]))[0])
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("get_mint_fee: masterChef.depositFee tinycent=%s", tinycent)
+
+        if tinycent is None:
+            raise RuntimeError("tinycent no disponible (mintFee/depositFee)")
+
+        # 2) tinycent -> tinybars vía MasterChef.tinycentsToTinybars(uint256)
+        if not self._master_chef_addr:
+            raise RuntimeError("master_chef no configurado; no se permite fallback")
+        sel_tc = eth_utils.keccak(text="tinycentsToTinybars(uint256)")[:4]
+        calldata = sel_tc + int(tinycent).to_bytes(32, byteorder="big")
+        res2 = self._call_rpc("eth_call", [{"to": self._master_chef_addr, "data": "0x" + calldata.hex()}, "latest"])
+        tinybar = int(abi_decode(["uint256"], bytes.fromhex(res2[2:]))[0])
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("get_mint_fee: tinybar=%s (from tinycent=%s)", tinybar, tinycent)
+
+        # 3) tinybar -> wei (1 tinybar = 1e10 wei)
+        wei = tinybar * (10 ** 10)
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("get_mint_fee: wei=%s source=master_chef", wei)
+        return {"supported": True, "tinycent": int(tinycent), "tinybar": int(tinybar), "wei": int(wei), "source": "master_chef"}
+
+    def _mirror_exchange_rate(self) -> Dict[str, Any]:
+        """Obtiene el tipo de cambio cent<->HBAR del Mirror Node.
+        Retorna tinybar por cent: (hbar_equivalent * 1e8) / cent_equivalent.
+        """
+        import requests
+        url = "https://mainnet.mirrornode.hedera.com/api/v1/network/exchangerate"
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            cur = (data.get("current_rate") or data.get("current_rates") or {}).get("cent_equivalent")
+            hbar_eq = (data.get("current_rate") or data.get("current_rates") or {}).get("hbar_equivalent")
+            # Ajustar si el JSON viene en formato lista {"current_rate": {..}}
+            if cur is None or hbar_eq is None:
+                cr = data.get("current_rate") or data.get("current_rates")
+                if isinstance(cr, dict):
+                    cur = cr.get("cent_equivalent")
+                    hbar_eq = cr.get("hbar_equivalent")
+            cur = int(cur)
+            hbar_eq = int(hbar_eq)
+            if cur <= 0 or hbar_eq <= 0:
+                return {"ok": False, "reason": "exchange rate inválido"}
+            tinybar_per_cent = (hbar_eq * (10 ** 8)) // cur
+            return {"ok": True, "tinybar_per_cent": int(tinybar_per_cent)}
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)}
+
+    # ---------------- Tick math & amounts (cliente, alta precisión) ----------------
+    def _round_tick_to_spacing(self, tick: int, tick_spacing: int, mode: str = "floor") -> int:
+        if tick_spacing <= 0:
+            return tick
+        if mode == "ceil":
+            return ((tick + tick_spacing - 1) // tick_spacing) * tick_spacing
+        # floor por defecto
+        return (tick // tick_spacing) * tick_spacing
+
+    def _sqrt_ratio_x96_from_tick(self, tick: int) -> int:
+        # Precisión alta vía Decimal: sqrtPriceX96 = floor( (1.0001)^(tick/2) * 2^96 )
+        from decimal import Decimal, getcontext
+        getcontext().prec = 80
+        Q96 = Decimal(2) ** 96
+        base = Decimal("1.0001")
+        exp = Decimal(tick) / Decimal(2)
+        sqrt_price = base ** exp
+        val = sqrt_price * Q96
+        return int(val)  # floor
+
+    def _tick_from_sqrt_ratio_x96(self, sqrt_ratio_x96: int) -> int:
+        # tick ≈ floor( ln( (sqrt_ratio_x96 / 2^96)^2 ) / ln(1.0001) )
+        from decimal import Decimal, getcontext
+        import math
+        getcontext().prec = 80
+        Q96 = Decimal(2) ** 96
+        sr = Decimal(int(sqrt_ratio_x96)) / Q96
+        price = sr * sr
+        # usar log natural de float como aproximación (suficiente para guiado)
+        t = int(math.floor(math.log(float(price)) / math.log(1.0001)))
+        return t
+
+    def _liquidity_for_amounts(self, sqrtP_x96: int, sqrtA_x96: int, sqrtB_x96: int, amount0: int, amount1: int) -> int:
+        # Fórmulas estándar Uniswap v3 (escala decimal para claridad)
+        from decimal import Decimal, getcontext
+        getcontext().prec = 80
+        Q96 = Decimal(2) ** 96
+        sa = Decimal(min(sqrtA_x96, sqrtB_x96)) / Q96
+        sb = Decimal(max(sqrtA_x96, sqrtB_x96)) / Q96
+        sp = Decimal(sqrtP_x96) / Q96
+        a0 = Decimal(int(amount0))
+        a1 = Decimal(int(amount1))
+        if sp <= sa:
+            # solo token0
+            L = a0 * (sa * sb) / (sb - sa)
+        elif sp >= sb:
+            # solo token1
+            L = a1 / (sb - sa)
+        else:
+            L0 = a0 * (sp * sb) / (sb - sp)
+            L1 = a1 / (sp - sa)
+            L = min(L0, L1)
+        return int(L)
+
+    def _amounts_for_liquidity(self, sqrtP_x96: int, sqrtA_x96: int, sqrtB_x96: int, liquidity: int) -> Tuple[int, int]:
+        from decimal import Decimal, getcontext
+        getcontext().prec = 80
+        Q96 = Decimal(2) ** 96
+        sa = Decimal(min(sqrtA_x96, sqrtB_x96)) / Q96
+        sb = Decimal(max(sqrtA_x96, sqrtB_x96)) / Q96
+        sp = Decimal(sqrtP_x96) / Q96
+        L = Decimal(int(liquidity))
+        if sp <= sa:
+            # todo en token0
+            amount0 = L * (sb - sa) / (sa * sb)
+            amount1 = Decimal(0)
+        elif sp >= sb:
+            # todo en token1
+            amount0 = Decimal(0)
+            amount1 = L * (sb - sa)
+        else:
+            amount0 = L * (sb - sp) / (sp * sb)
+            amount1 = L * (sp - sa)
+        return int(amount0), int(amount1)
+
+    # ---------------- Pool: tickSpacing ----------------
+    def _pool_tick_spacing(self, pool_contract_evm: str) -> Optional[int]:
+        # Lee tickSpacing() del pool si se desea validación fina de ticks
+        try:
+            import eth_utils  # type: ignore
+            from eth_abi import decode as abi_decode  # type: ignore
+        except Exception:
+            return None
+        try:
+            sel = eth_utils.keccak(text="tickSpacing()")[:4]
+            res = self._call_rpc("eth_call", [{"to": pool_contract_evm, "data": "0x" + sel.hex()}, "latest"])
+            val = abi_decode(["int24"], bytes.fromhex(res[2:]))[0]
+            return int(val)
+        except Exception:
+            return None
+
+    # ---------------- Pool: token0/token1 ----------------
+    def _pool_token0_token1(self, pool_contract_evm: str) -> Optional[Tuple[str, str]]:
+        try:
+            import eth_utils  # type: ignore
+            from eth_abi import decode as abi_decode  # type: ignore
+        except Exception:
+            return None
+        try:
+            sel0 = eth_utils.keccak(text="token0()")[:4]
+            sel1 = eth_utils.keccak(text="token1()")[:4]
+            r0 = self._call_rpc("eth_call", [{"to": pool_contract_evm, "data": "0x" + sel0.hex()}, "latest"])
+            r1 = self._call_rpc("eth_call", [{"to": pool_contract_evm, "data": "0x" + sel1.hex()}, "latest"])
+            a0 = abi_decode(["address"], bytes.fromhex(r0[2:]))[0]
+            a1 = abi_decode(["address"], bytes.fromhex(r1[2:]))[0]
+            if isinstance(a0, str) and isinstance(a1, str):
+                return (a0, a1)
+            return None
+        except Exception:
+            return None
+
+    # ---------------- Factory & Pool ABI loaders ----------------
+    def _ensure_factory_abi_loaded(self) -> None:
+        if self._factory_abi is not None:
+            return
+        path = self._factory_abi_path
+        if not path or not os.path.exists(path):
+            self._factory_abi = []
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._factory_abi = json.load(f)
+        except Exception as exc:
+            self.logger.warning("No se pudo cargar Factory ABI: %s", exc)
+            self._factory_abi = []
+
+    def _ensure_pool_abi_loaded(self) -> None:
+        if self._pool_abi is not None:
+            return
+        path = self._pool_abi_path
+        if not path or not os.path.exists(path):
+            self._pool_abi = []
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._pool_abi = json.load(f)
+        except Exception as exc:
+            self.logger.warning("No se pudo cargar Pool ABI: %s", exc)
+            self._pool_abi = []
+
+    def _ensure_tick_lens_abi_loaded(self) -> None:
+        if self._tick_lens_abi is not None:
+            return
+        path = self._tick_lens_abi_path
+        if not path or not os.path.exists(path):
+            self._tick_lens_abi = []
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._tick_lens_abi = json.load(f)
+        except Exception as exc:
+            self.logger.warning("No se pudo cargar TickLens ABI: %s", exc)
+            self._tick_lens_abi = []
+
+    def _ensure_master_chef_abi_loaded(self) -> None:
+        if self._master_chef_abi is not None:
+            return
+        path = self._master_chef_abi_path
+        if not path or not os.path.exists(path):
+            self._master_chef_abi = []
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._master_chef_abi = json.load(f)
+        except Exception as exc:
+            self.logger.warning("No se pudo cargar MasterChef ABI: %s", exc)
+            self._master_chef_abi = []
+
+    # ---------------- Liquidity: Quote/Prepare/Send (por ticks) ----------------
+    def liquidity_quote_by_ticks(
+        self,
+        tokenA: str,
+        tokenB: str,
+        fee_bps: int,
+        tick_lower: int,
+        tick_upper: int,
+        amount0_desired: int,
+        amount1_desired: int,
+        slippage_bps: int = 50,
+        recipient_evm: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Pre-cálculo para nueva posición V2 dado un rango de ticks y amounts deseados.
+        - No consulta on-chain cantidades exactas; aplica mínimos via slippage.
+        - Verifica existencia de pool (REST) y normaliza tokens (HBAR->WHBAR HTS/EVM).
+        Retorna un objeto 'quote' que alimenta liquidity_prepare.
+        """
+        notes: List[str] = []
+        # Normalizar tokens de entrada a HTS ids cuando sea posible para checks/association
+        def norm_hts(t: str) -> str:
+            if isinstance(t, str) and t.upper() == "HBAR":
+                wid = self._whbar_token_id()
+                if not wid:
+                    raise ValueError("WHBAR no disponible desde router")
+                return wid
+            return t
+        tA_hts = norm_hts(tokenA)
+        tB_hts = norm_hts(tokenB)
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("liq_quote: tokens HTS tA=%s tB=%s fee_bps=%s", tA_hts, tB_hts, fee_bps)
+        # EVM addresses para NPM
+        tA_evm = self._hts_to_evm(tA_hts)
+        tB_evm = self._hts_to_evm(tB_hts)
+        if not (isinstance(tA_evm, str) and tA_evm.startswith("0x") and isinstance(tB_evm, str) and tB_evm.startswith("0x")):
+            raise ValueError("No se pudieron derivar direcciones EVM de tokenA/tokenB")
+
+        # Validación básica de ticks
+        if not isinstance(tick_lower, int) or not isinstance(tick_upper, int) or tick_lower >= tick_upper:
+            raise ValueError("tick_lower/tick_upper inválidos (tick_lower < tick_upper)")
+
+        # Comprobar existencia de pool
+        p = self.pool_exists(tA_hts, tB_hts, int(fee_bps))
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("liq_quote: pool_exists -> %s", p)
+        if not p.get("exists"):
+            return {"exists": False, "reason": "pool no existe", "details": p}
+
+        pool_id = p.get("poolId")
+
+        # Mínimos por slippage (simple)
+        amt0_min = (int(amount0_desired) * (10000 - int(slippage_bps))) // 10000
+        amt1_min = (int(amount1_desired) * (10000 - int(slippage_bps))) // 10000
+
+        out = {
+            "exists": True,
+            "kind": "liquidity_by_ticks",
+            "tokens": {
+                "tokenA_hts": tA_hts,
+                "tokenB_hts": tB_hts,
+                "tokenA_evm": tA_evm,
+                "tokenB_evm": tB_evm,
+            },
+            "fee_bps": int(fee_bps),
+            "ticks": {"lower": int(tick_lower), "upper": int(tick_upper)},
+            "amounts": {
+                "amount0Desired": int(amount0_desired),
+                "amount1Desired": int(amount1_desired),
+                "amount0Min": int(amt0_min),
+                "amount1Min": int(amt1_min),
+            },
+            "pool": {"poolId": pool_id, "contractId": p.get("contractId")},
+            "slippage_bps": int(slippage_bps),
+            "recipient": recipient_evm or self.evm_address,
+            "notes": notes,
+        }
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("liq_quote: ticks [%s,%s] amounts(desired)=(%s,%s) poolId=%s", out["ticks"]["lower"], out["ticks"]["upper"], out["amounts"]["amount0Desired"], out["amounts"]["amount1Desired"], pool_id)
+        return out
+
+    def liquidity_prepare(self, quote: Dict[str, Any], deadline_s: int = 300) -> Dict[str, Any]:
+        """Prepara calldata para NonfungiblePositionManager.mint(...) a partir de 'quote'.
+        - Auto-asocia tokens A/B y LP NFT si faltan.
+        - Prepara approve(MAX) al NPM si allowance insuficiente.
+        - No envía la transacción; devuelve {to,data,value,gasEstimate,approve?,association?}.
+        """
+        from eth_abi import encode as abi_encode  # type: ignore
+        import eth_utils  # type: ignore
+        import time
+
+        if not isinstance(quote, dict) or not quote.get("exists"):
+            raise ValueError("quote inválido o pool no existe")
+        self._ensure_npm_abi_loaded()
+        npm = self._get_npm_address_evm()
+        if not npm:
+            raise ValueError("nonfungible_position_manager no configurado correctamente")
+
+        tokens = quote.get("tokens", {})
+        tA_hts = tokens.get("tokenA_hts")
+        tB_hts = tokens.get("tokenB_hts")
+        tA_evm = tokens.get("tokenA_evm")
+        tB_evm = tokens.get("tokenB_evm")
+        fee_bps = int(quote.get("fee_bps"))
+        ticks = quote.get("ticks", {})
+        tick_lower = int(ticks.get("lower"))
+        tick_upper = int(ticks.get("upper"))
+        amts = quote.get("amounts", {})
+        amt0_des = int(amts.get("amount0Desired", 0))
+        amt1_des = int(amts.get("amount1Desired", 0))
+        amt0_min = int(amts.get("amount0Min", 0))
+        amt1_min = int(amts.get("amount1Min", 0))
+        recipient = quote.get("recipient") or self.evm_address
+
+        notes: List[str] = []
+        association: Dict[str, Any] = {"executed": False, "steps": []}
+        approve_steps: List[Dict[str, Any]] = []
+        can_send: bool = True
+
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                "liq_prep: npm=%s fee_bps=%s ticks=[%s,%s] amounts(desired)=(%s,%s) mins=(%s,%s) recipient=%s",
+                npm, fee_bps, tick_lower, tick_upper, amt0_des, amt1_des, amt0_min, amt1_min, recipient
+            )
+
+        # Asociar HTS tokens A/B y LP NFT (forzar vía SDK para evitar lag del Mirror)
+        try:
+            to_assoc_set = set()
+            for t in (tA_hts, tB_hts):
+                if isinstance(t, str) and t.count(".") == 2:
+                    to_assoc_set.add(t)
+            if self._lp_nft_id and isinstance(self._lp_nft_id, str):
+                to_assoc_set.add(self._lp_nft_id)
+            to_assoc = [x for x in to_assoc_set]
+            if to_assoc:
+                res = self.associate_execute(to_assoc)
+                association = res
+                # pequeña espera para propagación
+                try:
+                    import time as _t
+                    _t.sleep(2)
+                except Exception:
+                    pass
+        except Exception as exc:
+            notes.append(f"association error: {exc}")
+
+        deadline_ts = int(time.time()) + int(deadline_s)
+
+        # Construir calldata mint((...))
+        # Reordenar tokens/amounts a token0/token1 del pool
+        pool_id_hts = (quote.get("pool") or {}).get("contractId")
+        pool_evm_addr = self._hts_to_evm(pool_id_hts) if pool_id_hts else None
+        # Canonizar pool si el contractId HTS no resuelve a un EVM válido
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("liq_prep: pool_id_hts=%s evm=%s", pool_id_hts, pool_evm_addr)
+        if not (isinstance(pool_evm_addr, str) and pool_evm_addr.startswith("0x")):
+            try:
+                if not (isinstance(tA_evm, str) and tA_evm.startswith("0x") and isinstance(tB_evm, str) and tB_evm.startswith("0x")):
+                    raise ValueError("tokens EVM inválidos para resolver pool")
+                if not self._factory_evm:
+                    raise ValueError("factory_v2 no configurada en YAML")
+                import eth_utils  # type: ignore
+                sel = eth_utils.keccak(text="getPool(address,address,uint24)")[:4]
+                def enc_addr(a: str) -> str: return a[2:].zfill(64)
+                def enc_u24(x: int) -> str: return hex(int(x))[2:].zfill(64)
+                data_ab = "0x" + sel.hex() + enc_addr(tA_evm) + enc_addr(tB_evm) + enc_u24(fee_bps)
+                data_ba = "0x" + sel.hex() + enc_addr(tB_evm) + enc_addr(tA_evm) + enc_u24(fee_bps)
+                r_ab = self._call_rpc("eth_call", [{"to": self._factory_evm, "data": data_ab}, "latest"]) or "0x0"
+                r_ba = self._call_rpc("eth_call", [{"to": self._factory_evm, "data": data_ba}, "latest"]) or "0x0"
+                evm_sel = r_ab if int(r_ab, 16) != 0 else r_ba
+                if int(evm_sel, 16) != 0:
+                    pool_evm_addr = "0x" + evm_sel[2:][-40:]
+                    resolved_hts = self._resolve_contract_hts_via_mirror(pool_evm_addr)
+                    if resolved_hts:
+                        pool_id_hts = resolved_hts
+                        if isinstance(quote.get("pool"), dict):
+                            quote["pool"]["contractId"] = resolved_hts
+                        else:
+                            quote["pool"] = {"contractId": resolved_hts}
+                    if self.logger.isEnabledFor(logging.INFO):
+                        self.logger.info("liq_prep: pool canonicalizado via Factory.getPool evm=%s hts=%s", pool_evm_addr, resolved_hts)
+                    notes.append("pool canonicalizado via Factory.getPool")
+            except Exception as _exc:
+                if self.logger.isEnabledFor(logging.WARNING):
+                    self.logger.warning("liq_prep: pool canonicalización fallida: %s", _exc)
+                notes.append(f"pool canonicalización fallida: {_exc}")
+        useA_evm, useB_evm = tA_evm, tB_evm
+        a0_des, a1_des, a0_min, a1_min = amt0_des, amt1_des, amt0_min, amt1_min
+        if pool_evm_addr:
+            tk = self._pool_token0_token1(pool_evm_addr)
+            if tk and isinstance(tk[0], str) and isinstance(tk[1], str):
+                token0, token1 = tk
+                # Mapear A/B a 0/1
+                if (tA_evm.lower() != token0.lower()) or (tB_evm.lower() != token1.lower()):
+                    # Permutar
+                    useA_evm, useB_evm = token0, token1
+                    # Si A no es token0, intercambiar amounts
+                    a0_des, a1_des = (amt1_des, amt0_des)
+                    a0_min, a1_min = (amt1_min, amt0_min)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("liq_prep: token0=%s token1=%s amounts0/1=%s/%s mins0/1=%s/%s",
+                              useA_evm, useB_evm, a0_des, a1_des, a0_min, a1_min)
+
+        # Approvals MAX al NPM (HTS allowance) basados en token0/token1 efectivos
+        try:
+            npm_hts = self._evm_to_hts(npm)
+            # Determinar los HTS ids correspondientes a token0/token1 efectivas
+            token0_hts = tA_hts if useA_evm.lower() == tA_evm.lower() else tB_hts
+            token1_hts = tB_hts if useB_evm.lower() == tB_evm.lower() else tA_hts
+            # token0
+            if int(a0_des) > 0 and isinstance(token0_hts, str) and token0_hts.upper() != "HBAR":
+                alw0 = self.allowance_check(token0_hts, spender=npm_hts)
+                if int(alw0.get("allowance", 0)) < int(a0_des):
+                    res0 = self.approve_hts_execute(token_id=token0_hts, spender_contract_id=npm_hts)
+                    approve_steps.append({"hts_allow_token0": res0})
+                    # Poll hasta ver allowance suficiente
+                    try:
+                        import time as _t
+                        for _ in range(20):
+                            _t.sleep(1)
+                            chk0 = self.allowance_check(token0_hts, spender=npm_hts)
+                            if int(chk0.get("allowance", 0)) >= int(a0_des):
+                                break
+                    except Exception:
+                        pass
+            # token1
+            if int(a1_des) > 0 and isinstance(token1_hts, str) and token1_hts.upper() != "HBAR":
+                alw1 = self.allowance_check(token1_hts, spender=npm_hts)
+                if int(alw1.get("allowance", 0)) < int(a1_des):
+                    res1 = self.approve_hts_execute(token_id=token1_hts, spender_contract_id=npm_hts)
+                    approve_steps.append({"hts_allow_token1": res1})
+                    try:
+                        import time as _t
+                        for _ in range(20):
+                            _t.sleep(1)
+                            chk1 = self.allowance_check(token1_hts, spender=npm_hts)
+                            if int(chk1.get("allowance", 0)) >= int(a1_des):
+                                break
+                    except Exception:
+                        pass
+        except Exception as exc:
+            notes.append(f"hts allow error (post-reorder): {exc}")
+
+        # Construir multicall([mint(params), refundETH()]) según docs oficiales
+        entry_mint = self._abi_find_function(self._npm_abi, "mint", [
+            "(address,address,uint24,int24,int24,uint256,uint256,uint256,uint256,address,uint256)"
+        ]) or {}
+        sel_mint = self._abi_selector_from_entry(entry_mint) or eth_utils.keccak(
+            text="mint((address,address,uint24,int24,int24,uint256,uint256,uint256,uint256,address,uint256))"
+        )[:4]
+        params_tuple = (
+            useA_evm, useB_evm, int(fee_bps), int(tick_lower), int(tick_upper),
+            int(a0_des), int(a1_des), int(a0_min), int(a1_min),
+            recipient, int(deadline_ts)
+        )
+        mint_data = sel_mint + abi_encode([
+            "(address,address,uint24,int24,int24,uint256,uint256,uint256,uint256,address,uint256)"
+        ], [params_tuple])
+
+        # refundETH()
+        sel_refund = eth_utils.keccak(text="refundETH()")[:4]
+
+        # multicall(bytes[])
+        entry_mc = self._abi_find_function(self._npm_abi, "multicall", ["bytes[]"]) or {}
+        sel_mc = self._abi_selector_from_entry(entry_mc) or eth_utils.keccak(text="multicall(bytes[])")[:4]
+        inner_calls = [mint_data, sel_refund]
+        multicall_data = sel_mc + abi_encode(["bytes[]"], [inner_calls])
+
+        tx = {"from": self.evm_address, "to": npm, "data": "0x" + multicall_data.hex()}
+        notes.append("mint via multicall([mint, refundETH])")
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("liq_prep: calldata.len=%s", len(tx["data"]))
+
+        # Chequeo de saldos antes de intentar estimar/enviar
+        try:
+            bal0 = self._erc20_balance_of(useA_evm, self.evm_address)
+            bal1 = self._erc20_balance_of(useB_evm, self.evm_address)
+            if int(a0_des) > 0 and int(bal0 or 0) < int(a0_des):
+                can_send = False
+                notes.append(f"saldo insuficiente token0: have={int(bal0 or 0)} need={int(a0_des)}")
+            if int(a1_des) > 0 and int(bal1 or 0) < int(a1_des):
+                can_send = False
+                notes.append(f"saldo insuficiente token1: have={int(bal1 or 0)} need={int(a1_des)}")
+        except Exception as exc:
+            notes.append(f"balance check error: {exc}")
+
+        # Mint fee exacto (usa HbarConversion si está disponible)
+        value_hex = None
+        mint_fee = self.get_mint_fee()
+        if mint_fee.get("supported") and isinstance(mint_fee.get("wei"), int):
+            fee_wei = int(mint_fee["wei"])
+            # Auto top-up HBAR 10% por encima de fee + gas fijo recomendado (900000)
+            gas_estimate_local: Optional[int] = 900000
+            gas_price = self._suggest_fees().get("gasPrice", 10_000_000_000)
+            need_wei = fee_wei + (int(gas_estimate_local) * int(gas_price))
+            need_wei = int(need_wei * 1.10)  # margen 10%
+            bal_hbar = self.get_balance("HBAR")
+            have_tinybar = int(bal_hbar.get("raw", 0))
+            have_wei = have_tinybar * (10 ** 10)
+            if have_wei < need_wei:
+                deficit_wei = need_wei - have_wei
+                notes.append(f"HBAR insuficiente: falta {deficit_wei} wei para fee+gas (con margen). Realiza swap USDC->HBAR.")
+            tx["value"] = hex(fee_wei)
+            value_hex = tx["value"]
+        else:
+            notes.append("mint fee no disponible; value=0")
+
+        # Gas fijo recomendado por documentación (900000)
+        gas_estimate: Optional[int] = 900000
+        notes.append("mint gasEstimate=900000 (docs)")
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("liq_prep: gas=900000 value=%s canSend=%s notes=%s", value_hex, can_send, "; ".join(notes))
+
+        return {
+            "to": npm,
+            "data": "0x" + multicall_data.hex(),
+            "value": value_hex,
+            "gasEstimate": gas_estimate,
+            "from": self.evm_address,
+            "association": association,
+            "approves": approve_steps if approve_steps else None,
+            "notes": notes,
+            "canSend": can_send,
+            "quote": quote,
+        }
+
+    def liquidity_send(self, prep: Dict[str, Any], wait: bool = True) -> Dict[str, Any]:
+        """Ejecuta approves preparados y la transacción de mint. Devuelve steps con receipt y, si es posible, tokenId."""
+        results: Dict[str, Any] = {"steps": []}
+        # Barrera de seguridad: solo bloquear si canSend=False (balances/fee incompletos)
+        if not prep or prep.get("canSend") is False:
+            return {
+                "steps": [],
+                "error": "mint bloqueado por prechecks fallidos",
+                "advice": "Revisa balances, allowances y fee HBAR. Recalcula con liquidity_prepare y reintenta.",
+                "prep": {
+                    "gasEstimate": prep.get("gasEstimate"),
+                    "canSend": prep.get("canSend"),
+                    "notes": prep.get("notes"),
+                },
+            }
+        # 1) approves
+        approves = prep.get("approves") or []
+        for ap in approves:
+            if not ap:
+                continue
+            txa = {"from": ap.get("from") or self.evm_address, "to": ap.get("to"), "data": ap.get("data")}
+            res_a = self.send_transaction(txa, wait=wait)
+            results["steps"].append({"approve": res_a})
+        # 2) mint (gas fijo 900000 según docs)
+        txm: Dict[str, Any] = {"from": prep.get("from") or self.evm_address, "to": prep["to"], "data": prep["data"], "gas": 900000}
+        if prep.get("value"):
+            txm["value"] = prep["value"]
+        # Top-up dinámico de fee justo antes de enviar para evitar INSUFFICIENT_TX_FEE
+        try:
+            mf_now = self.get_mint_fee()
+            if mf_now.get("supported") and isinstance(mf_now.get("wei"), int):
+                fee_now = int(mf_now["wei"])
+                fee_now = int(fee_now * 1.10)  # +10% colchón
+                prev_val = 0
+                if txm.get("value"):
+                    try:
+                        prev_val = int(str(txm.get("value")), 16)
+                    except Exception:
+                        prev_val = 0
+                use_val = max(prev_val, fee_now)
+                if use_val > 0:
+                    txm["value"] = hex(use_val)
+        except Exception:
+            pass
+        res_m = self.send_transaction(txm, wait=wait)
+        # Intentar extraer tokenId si está presente en logs (ERC721 Transfer del NPM)
+        token_id = None
+        try:
+            rec = res_m.get("receipt") or {}
+            logs = rec.get("logs") or []
+            npm_addr = (self._get_npm_address_evm() or "").lower()
+            # keccak256("Transfer(address,address,uint256)")
+            erc721_transfer_sig = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+            for lg in logs:
+                try:
+                    if str(lg.get("address", "")).lower() != npm_addr:
+                        continue
+                    topics = lg.get("topics") or []
+                    if len(topics) == 4 and str(topics[0]).lower() == erc721_transfer_sig:
+                        # tokenId en topics[3]
+                        tok_hex = str(topics[3])
+                        if tok_hex.startswith("0x"):
+                            token_id = int(tok_hex, 16)
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        results["steps"].append({"mint": res_m, "tokenId": token_id})
+        return results
+
+    def liquidity_send_sdk(self, prep: Dict[str, Any], wait: bool = True) -> Dict[str, Any]:
+        """Alternativa de envío usando Hedera SDK para capturar errorMessage en reverts.
+        Requiere que 'prep' provenga de liquidity_prepare. Usa gas=900000 y value convertido a tinybars.
+        """
+        try:
+            from hedera import (
+                Client as HClient,
+                AccountId as HAccountId,
+                PrivateKey as HPrivateKey,
+                ContractId as HContractId,
+                ContractExecuteTransaction,
+                Hbar as HHbar,
+            )
+        except Exception as exc:
+            return {"error": f"Hedera SDK no disponible: {exc}"}
+
+        to_evm = prep.get("to")
+        data_hex = prep.get("data")
+        if not (isinstance(to_evm, str) and to_evm.startswith("0x") and isinstance(data_hex, str) and data_hex.startswith("0x")):
+            return {"error": "prep inválido: faltan 'to' (0x..) o 'data' (0x..)"}
+
+        to_hts = self._evm_to_hts(to_evm)
+        if not to_hts:
+            return {"error": "no se pudo derivar ContractId HTS del destino"}
+
+        # Cargar operador
+        try:
+            with open(os.path.expanduser(self.config.private_key_path), "r", encoding="utf-8") as f:
+                key_json = json.load(f)
+            priv_str = key_json.get("private_key") or key_json.get("operator_private_key") or key_json.get("privkey")
+            if not priv_str:
+                return {"error": "private_key no encontrado en private_key_path"}
+            operator_id = HAccountId.fromString(self.account_id)
+            operator_key = self._load_hedera_private_key(priv_str)
+        except Exception as exc:
+            return {"error": f"error leyendo credenciales: {exc}"}
+
+        client = self._make_client()
+        client.setOperator(operator_id, operator_key)
+
+        # Preparar transacción
+        try:
+            func_bytes = bytes.fromhex(data_hex[2:])
+        except Exception as exc:
+            return {"error": f"data inválida: {exc}"}
+
+        # Convertir value (wei) -> tinybars
+        value_hex = prep.get("value")
+        tinybars = 0
+        if isinstance(value_hex, str) and value_hex.startswith("0x"):
+            try:
+                wei = int(value_hex, 16)
+                tinybars = wei // (10 ** 10)
+            except Exception:
+                tinybars = 0
+
+        tx = ContractExecuteTransaction()
+        tx.setContractId(HContractId.fromString(to_hts))
+        tx.setGas(900000)
+        if tinybars > 0:
+            tx.setPayableAmount(HHbar.fromTinybars(tinybars))
+        # setFunctionParameters necesita ByteString en algunas versiones del SDK
+        try:
+            from jnius import autoclass  # type: ignore
+            ByteString = autoclass('com.google.protobuf.ByteString')  # type: ignore
+            tx.setFunctionParameters(ByteString.copyFrom(func_bytes))
+        except Exception:
+            try:
+                tx.setFunctionParameters(bytearray(func_bytes))
+            except Exception as exc:
+                return {"error": f"setFunctionParameters failed: {exc}"}
+
+        try:
+            tx.freezeWith(client)
+            resp = tx.sign(operator_key).execute(client)
+            if wait:
+                # Intentar obtener TransactionRecord (preferible para errorMessage) evitando lanzar por receipt
+                record = None
+                try:
+                    record = resp.getRecord(client)
+                except Exception:
+                    try:
+                        from hedera import TransactionRecordQuery  # type: ignore
+                        q = TransactionRecordQuery()
+                        q.setTransactionId(resp.transactionId)
+                        q.setIncludeChildren(True)
+                        q.setIncludeDuplicates(True)
+                        record = q.execute(client)
+                    except Exception:
+                        record = None
+                # txId legible
+                try:
+                    txid_str = str(resp.transactionId)
+                except Exception:
+                    txid_str = ""
+                out: Dict[str, Any] = {"txId": txid_str}
+                if record is not None:
+                    try:
+                        result = getattr(record, "contractFunctionResult", None)
+                        emsg = getattr(result, "errorMessage", None) if result else None
+                        out["errorMessage"] = emsg
+                    except Exception:
+                        pass
+                    try:
+                        receipt = getattr(record, "receipt", None)
+                        if receipt is not None:
+                            try:
+                                out["receiptStatus"] = str(receipt.status.toString())
+                            except Exception:
+                                out["receiptStatus"] = str(receipt.status)
+                    except Exception:
+                        pass
+                else:
+                    # Como fallback, intenta solo el receipt (puede lanzar)
+                    try:
+                        receipt = resp.getReceipt(client)
+                        try:
+                            out["receiptStatus"] = str(receipt.status.toString())
+                        except Exception:
+                            out["receiptStatus"] = str(receipt.status)
+                    except Exception as exc_r:
+                        out["error"] = str(exc_r)
+                # Intentar adjuntar respuesta de Mirror Node para mayor detalle
+                try:
+                    import requests as _rq
+                    mn_url = f"https://mainnet.mirrornode.hedera.com/api/v1/transactions/{txid_str.replace('@','-')}"
+                    mnr = _rq.get(mn_url, timeout=10)
+                    if mnr.ok:
+                        out["mirror"] = mnr.json()
+                except Exception:
+                    pass
+                return out
+            else:
+                return {"txId": str(resp.transactionId)}
+        except Exception as exc:
+            return {"error": str(exc)}
 
     def get_pool_info(self, pool_id: Union[int, str]) -> Dict[str, Any]:
         """Obtiene la información pública de una pool de SaucerSwap por poolId.
@@ -587,6 +1556,11 @@ class SaucerSwapAdapter:
         for _ in range(len(self.config.json_rpc_endpoints) or 1):
             url = self.rpc.current
             try:
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    try:
+                        self.logger.debug("RPC call -> %s %s params=%s", url, method, json.dumps(params)[:2000])
+                    except Exception:
+                        self.logger.debug("RPC call -> %s %s (params non-serializable)", url, method)
                 r = requests.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=20)
                 try:
                     r.raise_for_status()
@@ -597,10 +1571,19 @@ class SaucerSwapAdapter:
                         body = r.json()
                     except Exception:
                         body = r.text
+                    if self.logger.isEnabledFor(logging.WARNING):
+                        self.logger.warning("RPC HTTP error (%s): %s body=%s", url, http_exc, body)
                     last_err = RuntimeError(f"HTTP {r.status_code}: {http_exc} body={body}")
                     raise last_err
                 data = r.json()
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    try:
+                        self.logger.debug("RPC result <- %s %s result=%s", url, method, json.dumps(data)[:2000])
+                    except Exception:
+                        self.logger.debug("RPC result <- %s %s (non-serializable)", url, method)
                 if "error" in data:
+                    if self.logger.isEnabledFor(logging.WARNING):
+                        self.logger.warning("RPC error payload (%s): %s", url, data.get("error"))
                     raise RuntimeError(data["error"])
                 return data.get("result")
             except Exception as exc:
@@ -627,6 +1610,19 @@ class SaucerSwapAdapter:
             realm = (evm_int >> (8 * 8)) & ((1 << 64) - 1)
             num = evm_int & ((1 << 64) - 1)
             return f"{shard}.{realm}.{num}"
+        except Exception:
+            return None
+
+    def _resolve_contract_hts_via_mirror(self, evm_addr: str) -> Optional[str]:
+        """Resuelve el ContractId (0.0.x) desde un address EVM usando Mirror Node."""
+        try:
+            import requests
+            url = f"https://mainnet.mirrornode.hedera.com/api/v1/contracts/{evm_addr}"
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            cid = data.get("contract_id")
+            return cid if isinstance(cid, str) and cid.count(".") == 2 else None
         except Exception:
             return None
 
@@ -665,6 +1661,8 @@ class SaucerSwapAdapter:
         tokens = [norm(token_in)] + [norm(t) for (t, _f) in route_hops] + [norm(token_out)]
         fees = [fee_bps] + [f for (_t, f) in route_hops]
         path = self._encode_path_v2(tokens, fees)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("get_quote: kind=%s amount=%s tokens=%s fees=%s", kind, amount, tokens, fees)
 
         quoter = self._hts_to_evm(self.config.contracts.get("quoter_v2", ""))
         if not quoter.startswith("0x"):
@@ -693,7 +1691,7 @@ class SaucerSwapAdapter:
             decoded = abi_decode(["uint256", "uint160[]", "uint32[]", "uint256"], bytes.fromhex(result[2:]))
         else:
             decoded = abi_decode(out_types, bytes.fromhex(result[2:]))
-        return {
+        out = {
             ("amountOut" if kind == "exact_in" else "amountIn"): int(decoded[0]),
             "sqrtPriceX96AfterList": [int(x) for x in decoded[1]],
             "initializedTicksCrossedList": [int(x) for x in decoded[2]],
@@ -707,6 +1705,9 @@ class SaucerSwapAdapter:
             "feeBps": int(fee_bps),
             "routeHops": route_hops or [],
         }
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("get_quote: %s -> %s result=%s", token_in, token_out, {k: out[k] for k in ("amountOut","amountIn","gasEstimate") if k in out})
+        return out
 
     # ---------------- Swap (preparación) ----------------
     def swap_prepare(self, swap_quote: Dict[str, Any], slippage_bps: int = 50, deadline_s: int = 300, recipient_evm: Optional[str] = None) -> Dict[str, Any]:
@@ -738,6 +1739,9 @@ class SaucerSwapAdapter:
         router = self._hts_to_evm(self.config.contracts.get("swap_router", ""))
         if not router.startswith("0x"):
             raise ValueError("swap_router no configurado correctamente")
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("swap_prepare: kind=%s tokenIn=%s tokenOut=%s requested=%s", kind, token_in_raw, token_out_raw, requested_amount)
 
         if kind == "exact_in":
             if amount_out is None:
@@ -783,12 +1787,24 @@ class SaucerSwapAdapter:
                 allowance_current = current
                 allowance_needed = int(needed)
                 if current < int(needed):
-                    # MAX_UINT256
-                    max_uint = (1 << 256) - 1
-                    approve_tx = self.approve_prepare(token_in_raw, max_uint)
-                    notes.append("approve(MAX_UINT256) preparado por allowance insuficiente")
+                    # Ejecutar allowance HTS hacia el Router vía SDK (sin aprobar ERC20)
+                    spender_hts = self._evm_to_hts(router)
+                    res_hts = self.approve_hts_execute(token_id=token_in_raw, spender_contract_id=spender_hts)
+                    notes.append(f"approve HTS ejecutado: {res_hts}")
+                    # Poll corto para ver el nuevo allowance
+                    try:
+                        import time
+                        for _ in range(20):
+                            time.sleep(1)
+                            new_alw = self.allowance_check(token_in_raw)
+                            current = int(new_alw.get("allowance", 0))
+                            if current >= int(needed):
+                                break
+                        allowance_current = current
+                    except Exception:
+                        pass
             except Exception as exc:
-                notes.append(f"auto-approve error: {exc}")
+                notes.append(f"auto-approve HTS error: {exc}")
 
         # Deadline absoluto (epoch seconds)
         deadline_ts = int(time.time()) + int(os.environ.get("SWAP_DEADLINE_S", str(deadline_s)))
@@ -857,6 +1873,8 @@ class SaucerSwapAdapter:
         tx = {"from": sender, "to": router, "data": "0x" + tx_data.hex()}
         if value:
             tx["value"] = hex(value)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("swap_prepare: to=%s value=%s data.len=%s", router, tx.get("value"), len(tx["data"]))
 
         gas_estimate: Optional[int] = None
         try:
@@ -866,7 +1884,7 @@ class SaucerSwapAdapter:
             notes.append("eth_estimateGas revert: verificar asociación HTS del token_out, allowance si aplica y uso de multicall para HBAR")
             self.logger.warning("eth_estimateGas failed: %s", exc)
 
-        return {
+        out = {
             "to": router,
             "data": "0x" + tx_data.hex(),
             "value": value,
@@ -882,6 +1900,9 @@ class SaucerSwapAdapter:
             } if not is_hbar_in else None,
             "approve": approve_tx,
         }
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("swap_prepare: gasEstimate=%s association=%s allowance=%s", gas_estimate, bool(association), (out.get("allowance") or {}))
+        return out
 
     # ---------------- Envío de transacciones ----------------
     def _get_chain_id(self) -> int:
@@ -921,6 +1942,8 @@ class SaucerSwapAdapter:
         chain_id = self._get_chain_id()
         nonce = self._get_nonce(address_from)
         fees = self._suggest_fees()
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("send_tx: from=%s to=%s chainId=%s nonce=%s", address_from, tx.get("to"), chain_id, nonce)
 
         # Construir tx a firmar
         tx_to_sign: Dict[str, Any] = {
@@ -938,14 +1961,18 @@ class SaucerSwapAdapter:
         # fees
         # Forzamos legacy en Hedera
         tx_to_sign.update({"gasPrice": fees["gasPrice"]})
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("send_tx: gasPrice=%s gas(pre)=%s value=%s", tx_to_sign.get("gasPrice"), tx_to_sign.get("gas"), tx_to_sign.get("value"))
 
         # Si falta gas, intenta estimar
         if "gas" not in tx_to_sign:
             try:
                 est = self._call_rpc("eth_estimateGas", [{"from": address_from, "to": tx["to"], "data": tx_to_sign["data"], "value": hex(tx_to_sign.get("value", 0)) if tx_to_sign.get("value") else "0x0"}, "latest"])
                 tx_to_sign["gas"] = int(est, 16) if isinstance(est, str) else est
-            except Exception:
+            except Exception as exc:
                 tx_to_sign["gas"] = 300000
+                if self.logger.isEnabledFor(logging.WARNING):
+                    self.logger.warning("send_tx: fallback gas=300000 (estimate failed: %s)", exc)
 
         # Firmar y enviar
         acct = Account.from_key(bytes.fromhex(self._private_key_hex))
@@ -953,6 +1980,8 @@ class SaucerSwapAdapter:
         raw_hex = signed.rawTransaction.hex()
         payload = raw_hex if isinstance(raw_hex, str) and raw_hex.startswith("0x") else ("0x" + raw_hex)
         tx_hash = self._call_rpc("eth_sendRawTransaction", [payload])
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("send_tx: hash=%s", tx_hash)
         out: Dict[str, Any] = {"txHash": tx_hash}
 
         if wait:
@@ -970,15 +1999,19 @@ class SaucerSwapAdapter:
                             if rv:
                                 decoded = self._decode_revert_data(rv)
                                 rec["revertDecoded"] = decoded
+                                if self.logger.isEnabledFor(logging.WARNING):
+                                    self.logger.warning("send_tx: receipt revert status with reason=%s decoded=%s", rv, decoded)
                         receipt = rec
                         break
                 except Exception:
                     pass
                 time.sleep(poll_s)
             out["receipt"] = receipt
+            if self.logger.isEnabledFor(logging.INFO):
+                self.logger.info("send_tx: receipt status=%s gasUsed=%s", (receipt or {}).get("status"), (receipt or {}).get("gasUsed"))
         return out
 
-    def swap_send(self, prep: Dict[str, Any], wait: bool = True) -> Dict[str, Any]:
+    def swap_send(self, prep: Dict[str, Any], wait: bool = True, sweep_whbar: bool = False) -> Dict[str, Any]:
         results: Dict[str, Any] = {"steps": []}
         # 1) approve si existe
         approve = prep.get("approve")
@@ -992,14 +2025,15 @@ class SaucerSwapAdapter:
             txs["value"] = prep["value"]
         res_s = self.send_transaction(txs, wait=wait)
         results["steps"].append({"swap": res_s})
-        # 3) Barrido WHBAR si quedara en el usuario (post-swap residual)
-        try:
-            owner = prep.get("from") or self.evm_address
-            sweep = self._whbar_sweep_unwrap(owner)
-            if sweep and (sweep.get("executed") or sweep.get("skipped")):
-                results["steps"].append({"whbar_sweep": sweep})
-        except Exception as exc:
-            results["steps"].append({"whbar_sweep": {"error": str(exc)}})
+        # 3) Barrido WHBAR opcional (post-swap residual). Desactivado por defecto para no interferir con mint.
+        if sweep_whbar or prep.get("sweep_whbar") is True:
+            try:
+                owner = prep.get("from") or self.evm_address
+                sweep = self._whbar_sweep_unwrap(owner)
+                if sweep and (sweep.get("executed") or sweep.get("skipped")):
+                    results["steps"].append({"whbar_sweep": sweep})
+            except Exception as exc:
+                results["steps"].append({"whbar_sweep": {"error": str(exc)}})
         return results
 
     # ---------------- Allowance (ERC20.approve) ----------------
@@ -1042,6 +2076,20 @@ class SaucerSwapAdapter:
         import requests
         acct = account_id or self.account_id
         base = f"https://mainnet.mirrornode.hedera.com/api/v1/accounts/{acct}/tokens?token.id={token_id}"
+        try:
+            r = requests.get(base, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            tokens = data.get("tokens", [])
+            associated = any(t.get("token_id") == token_id for t in tokens)
+            return {"associated": associated, "details": tokens}
+        except Exception as exc:
+            return {"associated": False, "error": str(exc)}
+
+    def check_contract_associated(self, token_id: str, contract_id: str) -> Dict[str, Any]:
+        """Comprueba si un contrato (0.0.x) está asociado a un token HTS en Mirror Node."""
+        import requests
+        base = f"https://mainnet.mirrornode.hedera.com/api/v1/accounts/{contract_id}/tokens?token.id={token_id}"
         try:
             r = requests.get(base, timeout=15)
             r.raise_for_status()
@@ -1107,9 +2155,15 @@ class SaucerSwapAdapter:
                 tx_signed = tx.sign(operator_key)
                 resp = tx_signed.execute(client)
                 rec = resp.getReceipt(client)
-                receipts.append({"batch": batch, "status": str(rec.status)})
+                result = {"batch": batch, "status": str(rec.status)}
+                receipts.append(result)
+                if self.logger.isEnabledFor(logging.INFO):
+                    self.logger.info("associate_execute: %s", result)
             except Exception as exc:
-                receipts.append({"batch": batch, "error": str(exc)})
+                err = {"batch": batch, "error": str(exc)}
+                receipts.append(err)
+                if self.logger.isEnabledFor(logging.WARNING):
+                    self.logger.warning("associate_execute failed: %s", err)
 
         return {"executed": True, "account_id": acct, "receipts": receipts}
 
@@ -1152,9 +2206,15 @@ class SaucerSwapAdapter:
             tx.freezeWith(client)
             resp = tx.sign(operator_key).execute(client)
             rec = resp.getReceipt(client)
-            return {"executed": True, "status": str(rec.status)}
+            out = {"executed": True, "status": str(rec.status)}
+            if self.logger.isEnabledFor(logging.INFO):
+                self.logger.info("approve_hts_execute: token=%s spender=%s amount=%s status=%s", token_id, spender_contract_id, amount, out["status"]) 
+            return out
         except Exception as exc:
-            return {"executed": False, "error": str(exc)}
+            err = {"executed": False, "error": str(exc)}
+            if self.logger.isEnabledFor(logging.WARNING):
+                self.logger.warning("approve_hts_execute failed: %s", err)
+            return err
 
     # ---------------- Allowance check (read-only) ----------------
     def allowance_check(self, token_in: str, owner_evm: Optional[str] = None, spender: Optional[str] = None) -> Dict[str, Any]:
@@ -1175,9 +2235,14 @@ class SaucerSwapAdapter:
 
         sel = eth_utils.keccak(text="allowance(address,address)")[:4]
         calldata = sel + abi_encode(["address", "address"], [owner, target_spender])
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("allowance_check: token=%s owner=%s spender=%s", token_in, owner, target_spender)
         res = self._call_rpc("eth_call", [{"to": token_evm, "data": "0x" + calldata.hex()}, "latest"])
         value = abi_decode(["uint256"], bytes.fromhex(res[2:]))[0]
-        return {"allowance": int(value)}
+        out = {"allowance": int(value)}
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("allowance_check: out=%s", out)
+        return out
 
     # ---------------- Asociación HTS (precompile prepare) ----------------
     def associate_prepare(self, token_ids: Union[str, List[str]], account_id: Optional[str] = None) -> Dict[str, Any]:
