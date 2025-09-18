@@ -1,0 +1,1 @@
+[{"type":"function","name":"exchangeRatePrecompileAddress","constant":true,"stateMutability":"view","payable":false,"inputs":[],"outputs":[{"type":"address","name":""}]}]
