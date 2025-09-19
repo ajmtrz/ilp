@@ -1305,6 +1305,15 @@ class SaucerSwapAdapter:
             inner_calls.append(sweep1)
         inner_calls.append(sel_refund)
         multicall_data = sel_mc + abi_encode(["bytes[]"], [inner_calls])
+        if self.logger.isEnabledFor(logging.DEBUG):
+            try:
+                self.logger.debug(
+                    "liq_prep encoders: sel_mint=%s sel_mc=%s parts_len=[%s,%s,%s,%s] total=%s",
+                    sel_mint.hex(), sel_mc.hex(),
+                    len(mint_data), len(sel_refund), len(sweep0 or b""), len(sweep1 or b""), len(multicall_data)
+                )
+            except Exception:
+                pass
 
         tx = {"from": self.evm_address, "to": npm, "data": "0x" + multicall_data.hex()}
         notes.append("mint via multicall([mint, refundETH])")
@@ -1428,6 +1437,12 @@ class SaucerSwapAdapter:
             txm["value"] = prep["value"]
 
         res_m = self.send_transaction(txm, wait=wait)
+        try:
+            rec = (res_m or {}).get("receipt")
+            if rec and isinstance(rec, dict):
+                self._log_remove_receipt(rec)
+        except Exception:
+            pass
 
         # 3) Fallback: intentar mint directo si multicall revirtió
         try:
@@ -1447,16 +1462,25 @@ class SaucerSwapAdapter:
         except Exception:
             pass
 
-        # 4) Intentar extraer tokenId del log Transfer (ERC721) del NPM
+        # 4) Intentar extraer tokenId del log Transfer (ERC721). En Hedera la
+        #    colección de LP NFTs puede ser un contrato distinto al NPM, así que
+        #    buscamos en ambos: NPM y contrato LP NFT (si está configurado).
         token_id = None
         try:
             rec = res_m.get("receipt") or {}
             logs = rec.get("logs") or []
             npm_addr = (self._get_npm_address_evm() or "").lower()
+            lp_evm = None
+            try:
+                if getattr(self, "_lp_nft_id", None):
+                    lp_evm = (self._hts_to_evm(self._lp_nft_id) or "").lower()
+            except Exception:
+                lp_evm = None
             erc721_transfer_sig = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
             for lg in logs:
                 try:
-                    if str(lg.get("address", "")).lower() != npm_addr:
+                    addr = str(lg.get("address", "")).lower()
+                    if addr not in filter(None, [npm_addr, lp_evm]):
                         continue
                     topics = lg.get("topics") or []
                     if len(topics) == 4 and str(topics[0]).lower() == erc721_transfer_sig:
@@ -1471,6 +1495,152 @@ class SaucerSwapAdapter:
 
         results["steps"].append({"mint": res_m, "tokenId": token_id})
         return results
+
+    # ---------------- Liquidity REMOVE (decrease + collect + burn) ----------------
+    def liquidity_decrease_prepare(
+        self,
+        serial: int,
+        liquidity: int,
+        amount0_min: int = 0,
+        amount1_min: int = 0,
+        deadline_s: int = 900,
+        recipient: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Prepara multicall para eliminar liquidez de una posición:
+        [decreaseLiquidity, collect, burn, (sweepToken0), (sweepToken1), refundETH].
+        - No envía la transacción; devuelve {to,data,value,gasEstimate,notes}.
+        - token0_evm/token1_evm opcionales para sweepToken; si no se pasan, se omiten los sweeps.
+        """
+        from eth_abi import encode as abi_encode  # type: ignore
+        import eth_utils  # type: ignore
+        import time
+
+        self._ensure_npm_abi_loaded()
+        npm = self._get_npm_address_evm()
+        if not npm:
+            raise ValueError("nonfungible_position_manager no configurado correctamente")
+
+        owner = recipient or self.evm_address
+        now = int(time.time())
+        # Alinear con UI: deadline en milisegundos
+        deadline_ts = (now + int(deadline_s)) * 1000
+        notes: List[str] = []
+
+        # decreaseLiquidity((uint256,uint128,uint256,uint256,uint256)) -> 0x0c49ccbe
+        sel_dec = eth_utils.keccak(text="decreaseLiquidity((uint256,uint128,uint256,uint256,uint256))")[:4]
+        dec_tuple = (int(serial), int(liquidity), int(amount0_min), int(amount1_min), int(deadline_ts))
+        dec_data = sel_dec + abi_encode(["(uint256,uint128,uint256,uint256,uint256)"], [dec_tuple])
+
+        # collect plano como en la UI: selector fijo 0xfc6f7865
+        sel_collect = bytes.fromhex("fc6f7865")
+        max_u128 = (1 << 128) - 1
+        col0_data = sel_collect + abi_encode(["uint256", "address", "uint128", "uint128"], [int(serial), owner, int(max_u128), 0])
+        col1_data = sel_collect + abi_encode(["uint256", "address", "uint128", "uint128"], [int(serial), owner, 0, int(max_u128)])
+
+        # burn(uint256) -> 0x42966c68
+        sel_burn = eth_utils.keccak(text="burn(uint256)")[:4]
+        burn_data = sel_burn + abi_encode(["uint256"], [int(serial)])
+
+        # sin unwrapWHBAR: se entregan WHBAR directamente al owner
+
+        # sweepToken del Router no existe en NPM; lo omitimos explícitamente
+
+        # Antes de multicall: aprobar HTS NFT (LP) al NPM para burn transfer
+        try:
+            lp_nft_id = getattr(self, "_lp_nft_id", None)
+            npm_hts = self._resolve_contract_hts_via_mirror(npm) or None
+            if lp_nft_id and npm_hts:
+                self.approve_hts_nft_execute(token_id=lp_nft_id, serial=int(serial), spender_contract_id=npm_hts)
+                notes.append(f"hts approve nft(serial) {lp_nft_id} -> {npm_hts} serial={serial}")
+        except Exception as aexc:
+            notes.append(f"hts approve warn: {aexc}")
+
+        # multicall(bytes[])
+        entry_mc = self._abi_find_function(self._npm_abi, "multicall", ["bytes[]"]) or {}
+        sel_mc = self._abi_selector_from_entry(entry_mc) or eth_utils.keccak(text="multicall(bytes[])")[:4]
+        # Orden: decrease -> collect0 -> collect1 -> burn
+        inner: List[bytes] = [dec_data, col0_data, col1_data, burn_data]
+        multicall_data = sel_mc + abi_encode(["bytes[]"], [inner])
+        if self.logger.isEnabledFor(logging.DEBUG):
+            try:
+                self.logger.debug(
+                    "remove encoders: sel_dec=%s sel_collect=%s sel_burn=%s sel_mc=%s parts_len=[%s,%s,%s,%s] total=%s",
+                    sel_dec.hex(), sel_collect.hex(), sel_burn.hex(), sel_mc.hex(),
+                    len(dec_data), len(col0_data), len(col1_data), len(burn_data), len(multicall_data)
+                )
+            except Exception:
+                pass
+
+        tx = {"from": self.evm_address, "to": npm, "data": "0x" + multicall_data.hex()}
+        gas_estimate: Optional[int] = 1_750_000
+        notes.append("remove gasEstimate~1.75M (alineado UI)")
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                "liq_decrease_prep: tokenId=%s liq=%s mins=(%s,%s) deadline=%s gas=%s",
+                serial, liquidity, amount0_min, amount1_min, deadline_ts, gas_estimate,
+            )
+
+        return {
+            "to": npm,
+            "data": "0x" + multicall_data.hex(),
+            "from": self.evm_address,
+            "gasEstimate": gas_estimate,
+            "value": None,
+            "notes": notes,
+        }
+
+    def liquidity_decrease_send(self, prep: Dict[str, Any], wait: bool = True) -> Dict[str, Any]:
+        """Envía la transacción de remove (multicall) por JSON-RPC. Devuelve receipt y cantidades si están en logs."""
+        results: Dict[str, Any] = {"steps": []}
+        if not prep or not isinstance(prep.get("to"), str) or not isinstance(prep.get("data"), str):
+            return {"error": "prep inválido"}
+        tx: Dict[str, Any] = {
+            "from": prep.get("from") or self.evm_address,
+            "to": prep["to"],
+            "data": prep["data"],
+            "gas": int(prep.get("gasEstimate") or 1_750_000),
+        }
+        if prep.get("value"):
+            tx["value"] = prep["value"]
+        res = self.send_transaction(tx, wait=wait)
+        results["steps"].append({"remove": res})
+        try:
+            rec = (res or {}).get("receipt")
+            if rec and isinstance(rec, dict):
+                self._log_remove_receipt(rec)
+        except Exception:
+            pass
+        return results
+
+    def _log_remove_receipt(self, receipt: Dict[str, Any]) -> None:
+        """Emite logs útiles del receipt de remove, incluyendo tópicos y tamaños de data."""
+        logs_list = receipt.get("logs") or []
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("remove receipt: status=%s gasUsed=%s logs=%s", receipt.get("status"), receipt.get("gasUsed"), len(logs_list))
+        for idx, lg in enumerate(logs_list):
+            try:
+                addr = lg.get("address")
+                topics = lg.get("topics") or []
+                t0 = topics[0] if topics else None
+                data_hex = lg.get("data") or "0x"
+                dlen = max(0, (len(data_hex) - 2) // 2)
+                if self.logger.isEnabledFor(logging.INFO):
+                    self.logger.info("log[%s]: addr=%s topic0=%s data_len=%s", idx, addr, t0, dlen)
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug("log[%s] data=%s", idx, data_hex)
+                # Intento simple: si data es múltiplo de 32 bytes hasta 3 palabras, decodificar uints
+                if dlen in (32, 64, 96):
+                    try:
+                        from eth_abi import decode as abi_decode  # type: ignore
+                        raw = bytes.fromhex(data_hex[2:])
+                        words = dlen // 32
+                        types = ["uint256"] * words
+                        vals = abi_decode(types, raw)
+                        self.logger.info("log[%s] decoded_uints=%s", idx, tuple(int(v) for v in vals))
+                    except Exception:
+                        pass
+            except Exception:
+                continue
 
     def get_pool_info(self, pool_id: Union[int, str]) -> Dict[str, Any]:
         """Obtiene la información pública de una pool de SaucerSwap por poolId.
@@ -2179,6 +2349,53 @@ class SaucerSwapAdapter:
             err = {"executed": False, "error": str(exc)}
             if self.logger.isEnabledFor(logging.WARNING):
                 self.logger.warning("approve_hts_execute failed: %s", err)
+            return err
+
+    def approve_hts_nft_execute(self, token_id: str, serial: int, spender_contract_id: str, account_id: Optional[str] = None) -> Dict[str, Any]:
+        """Aprueba vía Hedera SDK una allowance específica de NFT (serial) al spender.
+        Usa AccountAllowanceApproveTransaction.approveNftAllowance.
+        """
+        try:
+            from hedera import AccountId as HAccountId, Client as HClient
+            from hedera import PrivateKey as HPrivateKey
+            from hedera import TokenId as HTokenId, NftId as HNftId, AccountAllowanceApproveTransaction
+        except Exception as exc:
+            return {"executed": False, "error": f"Hedera SDK no disponible: {exc}"}
+
+        acct = account_id or self.account_id
+        try:
+            with open(os.path.expanduser(self.config.private_key_path), "r", encoding="utf-8") as f:
+                key_json = json.load(f)
+            priv_str = key_json.get("private_key") or key_json.get("operator_private_key") or key_json.get("privkey")
+            if not priv_str:
+                return {"executed": False, "error": "private_key no encontrado en private_key_path"}
+        except Exception as exc:
+            return {"executed": False, "error": f"error leyendo keyfile: {exc}"}
+
+        client = self._make_client()
+        operator_id = HAccountId.fromString(acct)
+        operator_key = self._load_hedera_private_key(priv_str)
+        client.setOperator(operator_id, operator_key)
+
+        try:
+            tx = AccountAllowanceApproveTransaction()
+            token_obj = HTokenId.fromString(token_id)
+            spender_id = HAccountId.fromString(spender_contract_id)
+            used = None
+            # Según tu SDK: approveTokenNftAllowance(NftId, owner, spender) ó (NftId, owner, spender, delegatingSpender)
+            nft_id = HNftId(token_obj, int(serial))
+            tx.approveTokenNftAllowance(nft_id, operator_id, spender_id)
+            tx.freezeWith(client)
+            resp = tx.sign(operator_key).execute(client)
+            rec = resp.getReceipt(client)
+            out = {"executed": True, "status": str(rec.status), "method": used}
+            if self.logger.isEnabledFor(logging.INFO):
+                self.logger.info("approve_hts_nft_execute: token=%s serial=%s spender=%s status=%s via %s", token_id, serial, spender_contract_id, out["status"], used) 
+            return out
+        except Exception as exc:
+            err = {"executed": False, "error": str(exc)}
+            if self.logger.isEnabledFor(logging.WARNING):
+                self.logger.warning("approve_hts_nft_execute failed: %s", err)
             return err
 
     # ---------------- Allowance check (read-only) ----------------
