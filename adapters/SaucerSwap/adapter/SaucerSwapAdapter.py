@@ -1218,48 +1218,61 @@ class SaucerSwapAdapter:
             token1_hts = tB_hts if useB_evm.lower() == tB_evm.lower() else tA_hts
             # token0
             if int(a0_des) > 0 and isinstance(token0_hts, str) and token0_hts.upper() != "HBAR":
+                # allowance_check soporta tanto HTS (convierte a EVM) como direcciones EVM
                 alw0 = self.allowance_check(token0_hts, spender=npm_hts)
                 if int(alw0.get("allowance", 0)) < int(a0_des):
-                    res0 = self.approve_hts_execute(token_id=token0_hts, spender_contract_id=npm_hts)
-                    approve_steps.append({"hts_allow_token0": res0})
-                    # Poll hasta ver allowance suficiente
-                    try:
-                        import time as _t
-                        for _ in range(20):
-                            _t.sleep(1)
-                            chk0 = self.allowance_check(token0_hts, spender=npm_hts)
-                            if int(chk0.get("allowance", 0)) >= int(a0_des):
-                                break
-                    except Exception:
-                        pass
+                    if token0_hts.count(".") == 2:
+                        res0 = self.approve_hts_execute(token_id=token0_hts, spender_contract_id=npm_hts)
+                        approve_steps.append({"hts_allow_token0": res0})
+                        # Poll hasta ver allowance suficiente
+                        try:
+                            import time as _t
+                            for _ in range(20):
+                                _t.sleep(1)
+                                chk0 = self.allowance_check(token0_hts, spender=npm_hts)
+                                if int(chk0.get("allowance", 0)) >= int(a0_des):
+                                    break
+                        except Exception:
+                            pass
+                    else:
+                        notes.append("token0 no HTS: se omite approve HTS explícito (usar allowance ERC20 si aplica)")
             # token1
             if int(a1_des) > 0 and isinstance(token1_hts, str) and token1_hts.upper() != "HBAR":
                 alw1 = self.allowance_check(token1_hts, spender=npm_hts)
                 if int(alw1.get("allowance", 0)) < int(a1_des):
-                    res1 = self.approve_hts_execute(token_id=token1_hts, spender_contract_id=npm_hts)
-                    approve_steps.append({"hts_allow_token1": res1})
-                    try:
-                        import time as _t
-                        for _ in range(20):
-                            _t.sleep(1)
-                            chk1 = self.allowance_check(token1_hts, spender=npm_hts)
-                            if int(chk1.get("allowance", 0)) >= int(a1_des):
-                                break
-                    except Exception:
-                        pass
+                    if token1_hts.count(".") == 2:
+                        res1 = self.approve_hts_execute(token_id=token1_hts, spender_contract_id=npm_hts)
+                        approve_steps.append({"hts_allow_token1": res1})
+                        try:
+                            import time as _t
+                            for _ in range(20):
+                                _t.sleep(1)
+                                chk1 = self.allowance_check(token1_hts, spender=npm_hts)
+                                if int(chk1.get("allowance", 0)) >= int(a1_des):
+                                    break
+                        except Exception:
+                            pass
+                    else:
+                        notes.append("token1 no HTS: se omite approve HTS explícito (usar allowance ERC20 si aplica)")
             # En Hedera algunas rutas usan allowance directo al Pool; añadimos como refuerzo no bloqueante
             if isinstance(pool_hts_eff, str):
                 try:
                     if int(a0_des) > 0 and isinstance(token0_hts, str) and token0_hts.upper() != "HBAR":
                         alw0p = self.allowance_check(token0_hts, spender=pool_hts_eff)
                         if int(alw0p.get("allowance", 0)) < int(a0_des):
-                            res0p = self.approve_hts_execute(token_id=token0_hts, spender_contract_id=pool_hts_eff)
-                            approve_steps.append({"hts_allow_token0_pool": res0p})
+                            if token0_hts.count(".") == 2:
+                                res0p = self.approve_hts_execute(token_id=token0_hts, spender_contract_id=pool_hts_eff)
+                                approve_steps.append({"hts_allow_token0_pool": res0p})
+                            else:
+                                notes.append("token0 no HTS: se omite approve HTS al Pool")
                     if int(a1_des) > 0 and isinstance(token1_hts, str) and token1_hts.upper() != "HBAR":
                         alw1p = self.allowance_check(token1_hts, spender=pool_hts_eff)
                         if int(alw1p.get("allowance", 0)) < int(a1_des):
-                            res1p = self.approve_hts_execute(token_id=token1_hts, spender_contract_id=pool_hts_eff)
-                            approve_steps.append({"hts_allow_token1_pool": res1p})
+                            if token1_hts.count(".") == 2:
+                                res1p = self.approve_hts_execute(token_id=token1_hts, spender_contract_id=pool_hts_eff)
+                                approve_steps.append({"hts_allow_token1_pool": res1p})
+                            else:
+                                notes.append("token1 no HTS: se omite approve HTS al Pool")
                 except Exception as _ex2:
                     notes.append(f"pool allowance check warn: {_ex2}")
         except Exception as exc:
@@ -1364,19 +1377,12 @@ class SaucerSwapAdapter:
                         hbar_deficit_raw = need - have
             # convertir tinybars (raw de WHBAR) a wei: 1 tinybar = 10^10 wei
             deficit_wei = int(hbar_deficit_raw) * (10 ** 10)
-            # La UI envía también el bruto deseado de WHBAR en msg.value (no solo el déficit)
-            whbar_desired_raw = 0
-            if isinstance(whbar_hts, str):
-                if token0_hts == whbar_hts:
-                    whbar_desired_raw = int(a0_des)
-                elif token1_hts == whbar_hts:
-                    whbar_desired_raw = int(a1_des)
-            whbar_desired_wei = int(whbar_desired_raw) * (10 ** 10)
-            total_wei = fee_wei_val + max(deficit_wei, whbar_desired_wei)
+            # Nuevo comportamiento: solo cubrir mintFee + déficit de WHBAR, sin enviar el bruto deseado
+            total_wei = fee_wei_val + deficit_wei
             if total_wei > 0:
                 value_hex = hex(total_wei)
                 tx["value"] = value_hex
-                notes.append(f"msg.value = mintFee({fee_wei_val}) + WHBAR_raw({whbar_desired_raw})")
+                notes.append(f"msg.value = mintFee({fee_wei_val}) + deficitWHBAR_raw({hbar_deficit_raw})")
         except Exception as _vx:
             notes.append(f"value calc warn: {_vx}")
 
