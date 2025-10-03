@@ -12,3 +12,8 @@ raydium:
   program_id_clmm: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
   api_base: https://transaction-v1.raydium.io
   priority_fee_tier: h   # vh|h|m
+  # Liquidity defaults (used by notebooks/examples)
+  defaults:
+    slippage_bps: 150           # user-provided; adapter añade +100 bps de buffer interno
+    compute_unit_price_micro: 25000
+    compute_unit_limit: 600000

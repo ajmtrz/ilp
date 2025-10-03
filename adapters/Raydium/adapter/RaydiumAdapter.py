@@ -93,6 +93,524 @@ class RaydiumAdapter:
         self.owner_pubkey = self._derive_owner_from_keypair(self.config.keypair_path)
         self.SOL_MINT = "So11111111111111111111111111111111111111112"
 
+    def _is_sol_mint(self, mint: Optional[str]) -> bool:
+        try:
+            return isinstance(mint, str) and mint == self.SOL_MINT
+        except Exception:
+            return False
+
+    # ---------------- Tx helpers (inspección de receipts) ----------------
+    def _get_transaction_parsed(self, signature: str) -> Optional[Dict[str, Any]]:
+        """getTransaction(signature, jsonParsed). Devuelve result o None si falla."""
+        import requests
+        try:
+            rpc = self.rpc.current
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            }
+            resp = requests.post(rpc, json=payload, timeout=12)
+            resp.raise_for_status()
+            data = resp.json() or {}
+            return data.get("result")
+        except Exception as exc:
+            if self.logger.isEnabledFor(logging.WARNING):
+                self.logger.warning("getTransaction failed for %s: %s", signature, exc)
+            return None
+
+    def _extract_position_nfts_from_tx(self, tx_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Extrae posibles NFT de posición (Token-2022, amount 1 con decimals 0) otorgados al owner.
+        Heurística: mint con postBalance - preBalance = 1 para owner==self.owner_pubkey.
+        Devuelve {nfts:[mint...], pdas:[...]}.
+        """
+        try:
+            meta = (tx_result or {}).get("meta") or {}
+            pre = meta.get("preTokenBalances") or []
+            post = meta.get("postTokenBalances") or []
+            def to_map(arr: List[Dict[str, Any]]) -> Dict[Tuple[str,str], Dict[str, Any]]:
+                out: Dict[Tuple[str,str], Dict[str, Any]] = {}
+                for it in arr:
+                    try:
+                        mint = it.get("mint")
+                        owner = it.get("owner")
+                        if mint and owner:
+                            out[(str(mint), str(owner))] = it
+                    except Exception:
+                        continue
+                return out
+            pre_map = to_map(pre)
+            post_map = to_map(post)
+            gained: List[str] = []
+            for key, post_it in post_map.items():
+                mint, owner = key
+                if owner != self.owner_pubkey:
+                    continue
+                ui = (post_it.get("uiTokenAmount") or {})
+                dec = int(ui.get("decimals", 0)) if isinstance(ui.get("decimals"), (int, str)) else 0
+                amt_post = int(ui.get("amount", 0)) if isinstance(ui.get("amount"), (int, str)) else 0
+                pre_it = pre_map.get(key)
+                amt_pre = 0
+                if pre_it:
+                    ui0 = (pre_it.get("uiTokenAmount") or {})
+                    amt_pre = int(ui0.get("amount", 0)) if isinstance(ui0.get("amount"), (int, str)) else 0
+                if dec == 0 and (amt_post - amt_pre) == 1:
+                    gained.append(mint)
+            pdas: List[str] = []
+            for m in gained:
+                try:
+                    pda, _bump = self._derive_personal_position_pda(m)
+                    pdas.append(pda)
+                except Exception:
+                    continue
+            return {"nfts": gained, "pdas": pdas}
+        except Exception:
+            return {"nfts": [], "pdas": []}
+
+    def _ata_exists(self, ata_pubkey: Optional[str]) -> Optional[bool]:
+        """Devuelve True si la cuenta existe en RPC, False si no existe, None si error.
+        Usa getAccountInfo (encoding base64) reutilizando helper existente.
+        """
+        try:
+            if not ata_pubkey:
+                return None
+            b64 = self._get_account_info_base64(ata_pubkey)
+            return True if b64 else False
+        except Exception:
+            return None
+
+    # ---------------- CLMM: resolver pool por mints+fee ----------------
+    def _clmm_fetch_pools_by_mints(self, mint1: str, mint2: str) -> List[Dict[str, Any]]:
+        """Intenta obtener pools CLMM que involucren mint1 y mint2 usando la API v3.
+        Retorna lista de pools (dict), o [] si no se encuentran.
+        Endpoint correcto: /pools/info/mint (paginado)
+        """
+        import requests
+        base = "https://api-v3.raydium.io"
+        url = base.rstrip("/") + "/pools/info/mint"
+        q = {
+            "mint1": mint1,
+            "mint2": mint2,
+            "poolType": "concentrated",
+            "poolSortField": "default",
+            "sortType": "desc",
+            "pageSize": 20,
+            "page": 1,
+        }
+        try:
+            r = requests.get(url, params=q, timeout=20)
+            r.raise_for_status()
+            data = r.json() or {}
+            payload = (data.get("data") or {}) if isinstance(data, dict) else {}
+            items = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(items, list):
+                return items
+        except Exception as exc:
+            self.logger.warning("_clmm_fetch_pools_by_mints falló %s: %s", url, exc)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("_clmm_fetch_pools_by_mints sin resultados para %s/%s", mint1, mint2)
+        return []
+
+    def _clmm_resolve_pool(self, mintA: str, mintB: str, fee_bps: int) -> Optional[Dict[str, Any]]:
+        """Resuelve una pool CLMM concreta por mints y fee (bps). Devuelve el dict de la pool o None.
+        La API puede devolver múltiples pools; filtramos por mints (sin importar orden) y fee.
+        """
+        pools = self._clmm_fetch_pools_by_mints(mintA, mintB)
+        if not pools:
+            return None
+        target_set = {mintA, mintB}
+        fee_int = int(fee_bps)
+        def extract_mints(p: Dict[str, Any]) -> Optional[set]:
+            # Estructura de pools/info/mint: mintA/mintB son objetos con address
+            try:
+                ma_obj = p.get("mintA") or {}
+                mb_obj = p.get("mintB") or {}
+                ma = ma_obj.get("address") or ma_obj.get("mint") or p.get("mintA")
+                mb = mb_obj.get("address") or mb_obj.get("mint") or p.get("mintB")
+                if ma and mb:
+                    return {str(ma), str(mb)}
+            except Exception:
+                return None
+            return None
+        def extract_fee(p: Dict[str, Any]) -> Optional[int]:
+            """Devuelve fee en basis points (bps, 1 bps=0.01%).
+            Preferimos config.tradeFeeRate (ppm), luego feeRate (fracción), luego feeBps si existiera.
+            """
+            try:
+                cfg = p.get("config") or {}
+                tr = cfg.get("tradeFeeRate")
+                if tr is not None:
+                    # tradeFeeRate suele expresarse en ppm (1e6)
+                    # 400 -> 0.04% -> 4 bps
+                    val = float(tr)
+                    return int(round(val / 100.0))
+            except Exception:
+                pass
+            # feeRate como fracción (0.0004 => 4 bps)
+            try:
+                fr = p.get("feeRate")
+                if fr is not None:
+                    val = float(fr)
+                    return int(round(val * 1e4))
+            except Exception:
+                pass
+            # feeBps directo
+            try:
+                fb = p.get("feeBps")
+                if fb is not None:
+                    return int(fb)
+            except Exception:
+                pass
+            return None
+        def extract_tick_spacing(p: Dict[str, Any]) -> Optional[int]:
+            # pools/info/mint: tickSpacing en p["config"]["tickSpacing"]
+            try:
+                if p.get("tickSpacing") is not None:
+                    return int(p.get("tickSpacing"))
+            except Exception:
+                pass
+            try:
+                cfg = p.get("config") or {}
+                if cfg.get("tickSpacing") is not None:
+                    return int(cfg.get("tickSpacing"))
+            except Exception:
+                pass
+            return None
+        chosen: Optional[Dict[str, Any]] = None
+        for p in pools:
+            mints = extract_mints(p) or set()
+            if mints != target_set:
+                continue
+            pf = extract_fee(p)
+            if pf is None:
+                # si fee no está claro, lo aceptamos como candidato pero continuamos buscando coincidencia exacta
+                if chosen is None:
+                    chosen = p
+                continue
+            if pf == fee_int:
+                chosen = p
+                break
+        return chosen
+
+    def _snap_tick(self, tick: int, spacing: int, mode: str = "floor") -> int:
+        if not isinstance(spacing, int) or spacing <= 0:
+            return int(tick)
+        if mode == "ceil":
+            return ((int(tick) + spacing - 1) // spacing) * spacing
+        return (int(tick) // spacing) * spacing
+
+    # ---------------- Liquidez CLMM: Quote por ticks ----------------
+    def liquidity_quote_by_ticks(
+        self,
+        mintA: str,
+        mintB: str,
+        fee_bps: int,
+        tick_lower: int,
+        tick_upper: int,
+        amountA_desired: int,
+        amountB_desired: int,
+        slippage_bps: int = 50,
+        recipient: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Pre-cálculo para nueva posición CLMM dado un rango de ticks y amounts deseados.
+        - Valida que exista pool CLMM para (mintA,mintB,fee).
+        - Calcula mínimos por slippage (cliente).
+        - No consulta on-chain cantidades exactas.
+        """
+        if not isinstance(tick_lower, int) or not isinstance(tick_upper, int) or tick_lower >= tick_upper:
+            raise ValueError("tick_lower/tick_upper inválidos (tick_lower < tick_upper)")
+        recv = recipient or self.owner_pubkey
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("clmm_quote: mints A/B=%s/%s fee_bps=%s", mintA, mintB, fee_bps)
+        pool = self._clmm_resolve_pool(mintA, mintB, int(fee_bps))
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("clmm_quote: resolve_pool -> %s", {k: pool.get(k) for k in ("id","feeRate","ammConfig")} if isinstance(pool, dict) else pool)
+        if not pool:
+            return {"exists": False, "reason": "pool no existe", "details": {"mints": [mintA, mintB], "fee_bps": int(fee_bps)}}
+        # Validar/snap de ticks según tickSpacing si está disponible
+        tick_spacing = None
+        try:
+            tick_spacing = int((pool.get("ammConfig") or {}).get("tickSpacing") or pool.get("tickSpacing")) if isinstance(pool, dict) else None
+        except Exception:
+            tick_spacing = None
+        snapped_lower = int(tick_lower)
+        snapped_upper = int(tick_upper)
+        snapped = False
+        if isinstance(tick_spacing, int) and tick_spacing > 0:
+            s_lo = self._snap_tick(tick_lower, tick_spacing, mode="floor")
+            s_up = self._snap_tick(tick_upper, tick_spacing, mode="ceil")
+            if (s_lo, s_up) != (tick_lower, tick_upper):
+                snapped_lower, snapped_upper, snapped = s_lo, s_up, True
+        if snapped and snapped_lower >= snapped_upper:
+            return {"exists": False, "reason": "tick range colapsó tras snapping", "details": {"tick_spacing": tick_spacing, "proposed": [snapped_lower, snapped_upper]}}
+        # mínimos por slippage
+        slip = max(0, int(slippage_bps))
+        if slip == 0:
+            a_min, b_min = 0, 0
+        else:
+            a_min = (int(amountA_desired) * (10000 - slip)) // 10000
+            b_min = (int(amountB_desired) * (10000 - slip)) // 10000
+        out = {
+            "exists": True,
+            "kind": "clmm_liquidity_by_ticks",
+            "mints": {"mintA": mintA, "mintB": mintB},
+            "fee_bps": int(fee_bps),
+            "ticks": {"lower": int(snapped_lower), "upper": int(snapped_upper)},
+            "amounts": {
+                "amountADesired": int(amountA_desired),
+                "amountBDesired": int(amountB_desired),
+                "amountAMin": int(a_min),
+                "amountBMin": int(b_min),
+            },
+            "pool": {
+                "id": pool.get("id") or pool.get("poolId") or pool.get("address"),
+                "raw": pool,
+            },
+            "slippage_bps": int(slippage_bps),
+            "recipient": recv,
+            "notes": [],
+        }
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                "clmm_quote: ticks [%s,%s] amounts(desired)=(%s,%s) mins=(%s,%s) poolId=%s spacing=%s snapped=%s",
+                out["ticks"]["lower"], out["ticks"]["upper"],
+                out["amounts"]["amountADesired"], out["amounts"]["amountBDesired"],
+                out["amounts"]["amountAMin"], out["amounts"]["amountBMin"], out["pool"]["id"], tick_spacing, snapped,
+            )
+        if self.logger.isEnabledFor(logging.DEBUG):
+            try:
+                self.logger.debug("clmm_quote: out=%s", {k: out[k] for k in ("fee_bps","ticks","amounts","recipient")})
+            except Exception:
+                pass
+        return out
+
+    # ---------------- Liquidez CLMM: Prepare (open position + add liquidity) ----------------
+    def liquidity_prepare(self, quote: Dict[str, Any], compute_unit_price_micro: Optional[int] = None, compute_unit_limit: Optional[int] = None) -> Dict[str, Any]:
+        """Construye transacciones V0 para abrir posición CLMM y añadir liquidez usando la Transaction API.
+        - Requiere el resultado de liquidity_quote_by_ticks.
+        - Devuelve {transactions:[base64...], meta:{...}} listo para firmar/enviar.
+        """
+        if not isinstance(quote, dict) or not quote.get("exists"):
+            raise ValueError("quote inválido o pool no existe")
+        kind = quote.get("kind")
+        if kind != "clmm_liquidity_by_ticks":
+            raise ValueError("quote.kind inesperado para CLMM")
+
+        mints = quote.get("mints") or {}
+        mintA = str(mints.get("mintA"))
+        mintB = str(mints.get("mintB"))
+        amounts = quote.get("amounts") or {}
+        a_des = int(amounts.get("amountADesired", 0))
+        b_des = int(amounts.get("amountBDesired", 0))
+        a_min = int(amounts.get("amountAMin", 0))
+        b_min = int(amounts.get("amountBMin", 0))
+        ticks = quote.get("ticks") or {}
+        t_lo = int(ticks.get("lower"))
+        t_hi = int(ticks.get("upper"))
+        pool = quote.get("pool") or {}
+        pool_id = pool.get("id")
+        if not pool_id:
+            raise ValueError("pool_id ausente en quote.pool.id")
+        recipient = quote.get("recipient") or self.owner_pubkey
+
+        # Compute Budget por defecto (alineado a ejemplos de UI): 25k microLamports, 600k CUs
+        # Referencia: instrucciones Compute Budget en flujo de UI
+        cu_price = int(compute_unit_price_micro) if compute_unit_price_micro is not None else 25_000
+        cu_limit = int(compute_unit_limit) if compute_unit_limit is not None else 600_000
+
+        # wrapSol si participan SOL nativo en A o B
+        wrap_sol = self._is_sol_mint(mintA) or self._is_sol_mint(mintB)
+        # Estimar lamports a wrapear (en función del lado SOL)
+        wrap_lamports = 0
+        if wrap_sol:
+            if self._is_sol_mint(mintA):
+                wrap_lamports = int(a_des)
+            elif self._is_sol_mint(mintB):
+                wrap_lamports = int(b_des)
+
+        # Comprobaciones de saldo (amigables): si no hay saldo suficiente, marcar canSend y notas
+        notes: List[str] = []
+        can_send: bool = True
+        try:
+            # Obtener balances con la API de cuentas (owner)
+            # Tokens SPL (no SOL): consultamos token accounts por mint
+            import requests
+            rpc = self.rpc.current
+            # Balance de SOL (lamports) para cubrir rent y fee
+            try:
+                resp = requests.post(rpc, json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.owner_pubkey,{"commitment":"confirmed"}]}, timeout=10)
+                resp.raise_for_status()
+                sol_bal = int(((resp.json() or {}).get("result") or {}).get("value", 0))
+            except Exception:
+                sol_bal = 0
+            # Balance token A si no es SOL
+            bal_a = None
+            if not self._is_sol_mint(mintA):
+                try:
+                    ata_a = self._derive_ata(self.owner_pubkey, mintA)
+                    resp = requests.post(rpc, json={"jsonrpc":"2.0","id":1,"method":"getTokenAccountBalance","params":[ata_a,{"commitment":"confirmed"}]}, timeout=10)
+                    resp.raise_for_status()
+                    ui = ((resp.json() or {}).get("result") or {}).get("value") or {}
+                    bal_a = int(ui.get("amount", 0))
+                except Exception:
+                    bal_a = None
+            # Balance token B si no es SOL
+            bal_b = None
+            if not self._is_sol_mint(mintB):
+                try:
+                    ata_b = self._derive_ata(self.owner_pubkey, mintB)
+                    resp = requests.post(rpc, json={"jsonrpc":"2.0","id":1,"method":"getTokenAccountBalance","params":[ata_b,{"commitment":"confirmed"}]}, timeout=10)
+                    resp.raise_for_status()
+                    ui = ((resp.json() or {}).get("result") or {}).get("value") or {}
+                    bal_b = int(ui.get("amount", 0))
+                except Exception:
+                    bal_b = None
+
+            # Evaluar necesidades
+            # SOL requerido mínimo aproximado: wrap_lamports + margen para rent/fees
+            min_sol_needed = wrap_lamports
+            # margen estático conservador (p.ej., ~0.03 SOL en lamports); ajustable si fuese necesario
+            MARGIN_LAMPORTS = 30_000_000
+            min_sol_needed += MARGIN_LAMPORTS
+            if sol_bal < min_sol_needed:
+                can_send = False
+                notes.append(f"sol insuficiente: have={sol_bal} need>={min_sol_needed}")
+            if (not self._is_sol_mint(mintA)) and (bal_a is not None) and bal_a < a_des:
+                can_send = False
+                notes.append(f"tokenA insuficiente: have={bal_a} need>={a_des}")
+            if (not self._is_sol_mint(mintB)) and (bal_b is not None) and bal_b < b_des:
+                can_send = False
+                notes.append(f"tokenB insuficiente: have={bal_b} need>={b_des}")
+        except Exception as exc:
+            notes.append(f"balance check warn: {exc}")
+
+        # Pre-chequeo de ATAs del owner para mintA/mintB (solo tokens no SOL)
+        ata_info: Dict[str, Any] = {}
+        try:
+            if not self._is_sol_mint(mintA):
+                ata_a = self._derive_ata(self.owner_pubkey, mintA)
+                exists_a = self._ata_exists(ata_a)
+                ata_info["A"] = {"ata": ata_a, "exists": exists_a}
+            if not self._is_sol_mint(mintB):
+                ata_b = self._derive_ata(self.owner_pubkey, mintB)
+                exists_b = self._ata_exists(ata_b)
+                ata_info["B"] = {"ata": ata_b, "exists": exists_b}
+        except Exception as _exc_ata:
+            ata_info["error"] = str(_exc_ata)
+
+        # Construir payload para Transaction API (similar al flujo de swaps v0)
+        payload = {
+            "wallet": self.owner_pubkey,
+            "poolId": str(pool_id),
+            "tickLowerIndex": t_lo,
+            "tickUpperIndex": t_hi,
+            # amounts máximos a aportar (la API aplicará límites y min con slippage)
+            "amountA": a_des,
+            "amountB": b_des,
+            "amountAMin": a_min,
+            "amountBMin": b_min,
+            "recipient": recipient,
+            "txVersion": "V0",
+            "computeBudgetConfig": {
+                "microLamports": cu_price,
+                "units": cu_limit,
+            },
+        }
+        if wrap_sol:
+            payload["wrapSol"] = True
+
+        # Fallback Anchor: construir y empaquetar V0
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info("clmm_prepare(anchor): poolId=%s ticks=[%s,%s] amounts=(%s,%s) mins=(%s,%s) CU(price=%s,limit=%s)",
+                             pool_id, t_lo, t_hi, a_des, b_des, a_min, b_min, cu_price, cu_limit)
+        anchor_open = self.liquidity_prepare_anchor_open(
+            mintA=mintA, mintB=mintB, pool_id=pool_id,
+            tick_lower=t_lo, tick_upper=t_hi,
+            amountA_desired=a_des, amountB_desired=b_des,
+            slippage_bps=quote.get("slippage_bps", 50),
+            compute_unit_price_micro=cu_price, compute_unit_limit=cu_limit,
+        )
+        try:
+            tx_b64, extra_signers = self._assemble_v0_from_anchor(anchor_open)
+            meta = anchor_open.get("meta") or {}
+            meta["atas"] = ata_info or None
+            # Exponer anchor para que send pueda usar fallback de mint planificado
+            return {"transactions": [tx_b64], "meta": meta, "canSend": can_send, "notes": notes, "extraSigners": extra_signers, "anchor": (anchor_open.get("anchor") or {})}
+        except Exception as exc:
+            import traceback  # type: ignore
+            tb = traceback.format_exc()
+            notes.append(str(exc))
+            notes.append(f"trace={tb}")
+            err = f"{exc}\ntrace={tb}"
+            return {"transactions": [], "meta": anchor_open.get("meta"), "canSend": False, "notes": notes, "error": err}
+
+    # ---------------- Liquidez CLMM: Send ----------------
+    def liquidity_send(self, prep: Dict[str, Any], wait: bool = True) -> Dict[str, Any]:
+        """Firma y envía las transacciones V0 devueltas por liquidity_prepare.
+        Reutiliza el flujo de swap_send (firmado y confirmación) con las tx base64.
+        """
+        if not isinstance(prep, dict):
+            return {"error": "prep inválido"}
+        txs = prep.get("transactions")
+        if not isinstance(txs, list) or not all(isinstance(x, str) for x in txs):
+            return {"error": "prep.transactions inválido"}
+        # Reusar pipeline de swap_send: acepta {transactions: [...]} ya en base64
+        try:
+            # Pasar prep completo para soportar extraSigners en flujo Anchor
+            res = self.swap_send(prep, wait=wait)
+            if self.logger.isEnabledFor(logging.INFO):
+                self.logger.info("clmm_send: signatures=%s", (res.get("signatures") if isinstance(res, dict) else None))
+            # Extraer NFT/ids desde receipts (getTransaction por firma)
+            try:
+                sigs = (res.get("signatures") if isinstance(res, dict) else None) or []
+                all_nfts: List[str] = []
+                all_pdas: List[str] = []
+                for sig in sigs:
+                    txr = self._get_transaction_parsed(sig)
+                    if not txr:
+                        continue
+                    ext = self._extract_position_nfts_from_tx(txr)
+                    for m in ext.get("nfts", []):
+                        if m not in all_nfts:
+                            all_nfts.append(m)
+                    for p in ext.get("pdas", []):
+                        if p not in all_pdas:
+                            all_pdas.append(p)
+                # Fallback: si no se detecta NFT en receipts y venimos de Anchor, usar mint previsto
+                if not all_nfts:
+                    try:
+                        ix = ((prep or {}).get("anchor") or {}).get("ix") or {}
+                        pos = (ix.get("accounts") or {}).get("positionNft") or {}
+                        mint_planned = pos.get("mint")
+                        if isinstance(mint_planned, str) and mint_planned:
+                            all_nfts = [mint_planned]
+                            # Derivar PDA de posición personal para reportar
+                            try:
+                                pda, _b = self._derive_personal_position_pda(mint_planned)
+                                if pda:
+                                    all_pdas = [pda]
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                if isinstance(res, dict):
+                    res["position"] = {"nftMints": (all_nfts or None), "pdas": (all_pdas or None)}
+            except Exception:
+                pass
+            return res
+        except Exception as exc:
+            if self.logger.isEnabledFor(logging.WARNING):
+                self.logger.warning("clmm_send failed: %s", exc)
+            return {"error": str(exc)}
+
     # ---------------- Raydium Trade API: Quote ----------------
     def get_quote(self, input_mint: str, output_mint: str, amount: int, kind: str, slippage_bps: int) -> Dict[str, Any]:
         if kind not in ("exact_in", "exact_out"):
@@ -130,15 +648,17 @@ class RaydiumAdapter:
         }
 
     # ---------------- Raydium Trade API: Prepare ----------------
-    def _derive_ata(self, owner_pubkey: str, mint: str) -> Optional[str]:
-        """Deriva Associated Token Account (ATA) para (owner,mint)."""
+    def _derive_ata(self, owner_pubkey: str, mint: str, token_program_id: Optional[str] = None) -> Optional[str]:
+        """Deriva Associated Token Account (ATA) para (owner,mint).
+        Para Token-2022, pasar token_program_id="TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb".
+        """
         try:
             from solders.pubkey import Pubkey  # type: ignore
         except Exception as exc:
             self.logger.warning("solders no disponible para derivar ATA: %s", exc)
             return None
         try:
-            TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            TOKEN_PROGRAM_ID = Pubkey.from_string(token_program_id or "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
             ATA_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
             owner_pk = Pubkey.from_string(owner_pubkey)
             mint_pk = Pubkey.from_string(mint)
@@ -234,12 +754,750 @@ class RaydiumAdapter:
             raise RuntimeError(f"Falta dependencia solana-py: {exc}")
         return Client(self.rpc.current)
 
+    def _get_latest_blockhash(self) -> str:
+        import requests
+        data = self._rpc_call_with_failover("getLatestBlockhash", [{"commitment": "finalized"}])
+        result = data.get("result") or {}
+        value = result.get("value") or {}
+        bh = value.get("blockhash")
+        if not isinstance(bh, str):
+            raise RuntimeError("No se pudo obtener latest blockhash")
+        return bh
+
+    def _assemble_v0_from_anchor(self, anchor_obj: Dict[str, Any]) -> Tuple[str, List[str]]:
+        """Empaqueta ComputeBudget + ix Anchor en una transacción V0 y la devuelve en base64.
+        Retorna (tx_b64, extra_signers_b64[]).
+        """
+        try:
+            from solders.instruction import Instruction as SInstruction, AccountMeta  # type: ignore
+            from solders.message import MessageV0  # type: ignore
+            from solders.transaction import VersionedTransaction  # type: ignore
+            from solders.pubkey import Pubkey  # type: ignore
+            from solders.keypair import Keypair  # type: ignore
+            from solders.compute_budget import (  # type: ignore
+                set_compute_unit_price, set_compute_unit_limit,
+            )
+            from solders.hash import Hash as SolHash  # type: ignore
+            from solders.signature import Signature as SolSig  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(f"Faltan dependencias solders para ensamblar V0: {exc}")
+
+        anc = anchor_obj or {}
+        ix_desc = (anc.get("anchor") or {}).get("ix") or {}
+        cb = (anc.get("anchor") or {}).get("computeBudget") or {}
+        prewrap = (anc.get("anchor") or {}).get("prewrap") or []
+        postunwrap = (anc.get("anchor") or {}).get("postunwrap") or []
+        create_atas = (anc.get("anchor") or {}).get("createATAs") or []
+        # Autorrellenar prewrap si falta pero hay SOL en el par (basado en token_accounts y/o decodificando ix.data)
+        try:
+            if not prewrap:
+                meta = anc.get("meta") or {}
+                accs = (ix_desc.get("accounts") or {}) if isinstance(ix_desc, dict) else {}
+                token_accs = (accs.get("tokenAccounts") or {})
+                ta0 = token_accs.get("A") or ix_desc.get("token_account_0")
+                ta1 = token_accs.get("B") or ix_desc.get("token_account_1")
+                amounts = meta.get("amounts") or {}
+                expected_wsol_ata = self._derive_ata(self.owner_pubkey, self.SOL_MINT)
+                if isinstance(expected_wsol_ata, str):
+                    # Intento 1: usar meta (si existe)
+                    if isinstance(ta0, str) and ta0 == expected_wsol_ata and isinstance(amounts.get("A"), int) and int(amounts.get("A", 0)) > 0:
+                        prewrap = [{"kind": "wrap", "mint": self.SOL_MINT, "ata": ta0, "lamports": int(amounts.get("A", 0))}]
+                        postunwrap = postunwrap or [{"kind": "unwrap", "ata": ta0}]
+                    elif isinstance(ta1, str) and ta1 == expected_wsol_ata and isinstance(amounts.get("B"), int) and int(amounts.get("B", 0)) > 0:
+                        prewrap = [{"kind": "wrap", "mint": self.SOL_MINT, "ata": ta1, "lamports": int(amounts.get("B", 0))}]
+                        postunwrap = postunwrap or [{"kind": "unwrap", "ata": ta1}]
+                    else:
+                        # Intento 2: decodificar amounts desde ix.data (Anchor: discr(8) + i32*4 + u128 + u64(amount0) + u64(amount1) ...)
+                        try:
+                            data_b = ix_desc.get("data") if isinstance(ix_desc, dict) else None
+                            # Normalizar a bytes para poder decodificar amounts desde el payload Anchor
+                            if isinstance(data_b, list):
+                                try:
+                                    buf = bytearray()
+                                    for x in data_b:
+                                        if isinstance(x, int):
+                                            buf.append(x & 0xFF)
+                                        elif isinstance(x, (bytes, bytearray)):
+                                            buf.extend(x)
+                                        elif isinstance(x, str):
+                                            s = x.strip()
+                                            if s.startswith("0x"):
+                                                try:
+                                                    buf.extend(bytes.fromhex(s[2:]))
+                                                except Exception:
+                                                    buf.extend(s.encode("utf-8"))
+                                            else:
+                                                # intentar base64; si falla, utf-8
+                                                import base64 as _b64
+                                                try:
+                                                    buf.extend(_b64.b64decode(s))
+                                                except Exception:
+                                                    buf.extend(s.encode("utf-8"))
+                                        else:
+                                            buf.extend(bytes(str(x), "utf-8"))
+                                    data_b = bytes(buf)
+                                except Exception:
+                                    data_b = None
+                            elif isinstance(data_b, str):
+                                s = data_b.strip()
+                                if s.startswith("0x"):
+                                    try:
+                                        data_b = bytes.fromhex(s[2:])
+                                    except Exception:
+                                        data_b = s.encode("utf-8")
+                                else:
+                                    import base64 as _b64
+                                    try:
+                                        data_b = _b64.b64decode(s)
+                                    except Exception:
+                                        data_b = s.encode("utf-8")
+                            elif isinstance(data_b, memoryview):
+                                data_b = bytes(data_b)
+
+                            if isinstance(data_b, (bytes, bytearray)) and len(data_b) >= 56:
+                                amt0_le = int.from_bytes(bytes(data_b[40:48]), byteorder="little", signed=False)
+                                amt1_le = int.from_bytes(bytes(data_b[48:56]), byteorder="little", signed=False)
+                                if isinstance(ta0, str) and ta0 == expected_wsol_ata and amt0_le > 0:
+                                    prewrap = [{"kind": "wrap", "mint": self.SOL_MINT, "ata": ta0, "lamports": int(amt0_le)}]
+                                    postunwrap = postunwrap or [{"kind": "unwrap", "ata": ta0}]
+                                elif isinstance(ta1, str) and ta1 == expected_wsol_ata and amt1_le > 0:
+                                    prewrap = [{"kind": "wrap", "mint": self.SOL_MINT, "ata": ta1, "lamports": int(amt1_le)}]
+                                    postunwrap = postunwrap or [{"kind": "unwrap", "ata": ta1}]
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        # Reconciliar SIEMPRE el prewrap con el ATA WSOL y los amounts del payload Anchor
+        try:
+            meta = anc.get("meta") or {}
+            accs = (ix_desc.get("accounts") or {}) if isinstance(ix_desc, dict) else {}
+            token_accs = (accs.get("tokenAccounts") or {})
+            ta0 = token_accs.get("A") or ix_desc.get("token_account_0")
+            ta1 = token_accs.get("B") or ix_desc.get("token_account_1")
+            expected_wsol_ata = self._derive_ata(self.owner_pubkey, self.SOL_MINT)
+            # Decodificar amounts desde ix.data si es necesario
+            data_b2 = ix_desc.get("data") if isinstance(ix_desc, dict) else None
+            if isinstance(data_b2, list):
+                try:
+                    buf = bytearray()
+                    for x in data_b2:
+                        if isinstance(x, int):
+                            buf.append(x & 0xFF)
+                        elif isinstance(x, (bytes, bytearray)):
+                            buf.extend(x)
+                        elif isinstance(x, str):
+                            s = x.strip()
+                            if s.startswith("0x"):
+                                try:
+                                    buf.extend(bytes.fromhex(s[2:]))
+                                except Exception:
+                                    buf.extend(s.encode("utf-8"))
+                            else:
+                                import base64 as _b64
+                                try:
+                                    buf.extend(_b64.b64decode(s))
+                                except Exception:
+                                    buf.extend(s.encode("utf-8"))
+                        else:
+                            buf.extend(bytes(str(x), "utf-8"))
+                    data_b2 = bytes(buf)
+                except Exception:
+                    data_b2 = None
+            elif isinstance(data_b2, str):
+                s = data_b2.strip()
+                if s.startswith("0x"):
+                    try:
+                        data_b2 = bytes.fromhex(s[2:])
+                    except Exception:
+                        data_b2 = s.encode("utf-8")
+                else:
+                    import base64 as _b64
+                    try:
+                        data_b2 = _b64.b64decode(s)
+                    except Exception:
+                        data_b2 = s.encode("utf-8")
+            elif isinstance(data_b2, memoryview):
+                data_b2 = bytes(data_b2)
+            amt0_from_ix = None
+            amt1_from_ix = None
+            if isinstance(data_b2, (bytes, bytearray)) and len(data_b2) >= 56:
+                try:
+                    amt0_from_ix = int.from_bytes(bytes(data_b2[40:48]), byteorder="little", signed=False)
+                    amt1_from_ix = int.from_bytes(bytes(data_b2[48:56]), byteorder="little", signed=False)
+                except Exception:
+                    amt0_from_ix = None
+                    amt1_from_ix = None
+            def _ensure_prewrap_for(ata: Optional[str], amt: Optional[int]):
+                if not isinstance(ata, str) or ata != expected_wsol_ata or not isinstance(amt, int) or amt <= 0:
+                    return
+                # Buscar entrada existente y ajustarla
+                found = False
+                for w in prewrap:
+                    if isinstance(w, dict) and w.get("ata") == ata:
+                        found = True
+                        cur = int(w.get("lamports", 0))
+                        if amt > cur:
+                            w["lamports"] = int(amt)
+                        break
+                if not found:
+                    prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": ata, "lamports": int(amt)})
+            if isinstance(expected_wsol_ata, str):
+                _ensure_prewrap_for(ta0, amt0_from_ix)
+                _ensure_prewrap_for(ta1, amt1_from_ix)
+            # Garantizar postunwrap si hay prewrap WSOL y falta
+            if prewrap and not postunwrap:
+                try:
+                    # usar el primer ATA WSOL como destino de closeAccount
+                    for w in prewrap:
+                        if isinstance(w, dict) and w.get("mint") == self.SOL_MINT and isinstance(w.get("ata"), str):
+                            postunwrap = [{"kind": "unwrap", "ata": w.get("ata") }]
+                            break
+                except Exception:
+                    pass
+            if self.logger.isEnabledFor(logging.INFO):
+                try:
+                    self.logger.info("assemble_v0: prewrap reconciled count=%d", len(prewrap))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        prog_id = ix_desc.get("program_id")
+        keys_desc = ix_desc.get("keys", [])
+        data_bytes = ix_desc.get("data", b"")
+        # Normalizar data a bytes
+        if isinstance(data_bytes, list):
+            try:
+                buf = bytearray()
+                for x in data_bytes:
+                    if isinstance(x, int):
+                        buf.append(x & 0xFF)
+                    elif isinstance(x, (bytes, bytearray)):
+                        buf.extend(x)
+                    elif isinstance(x, str):
+                        s = x.strip()
+                        if s.startswith("0x"):
+                            buf.extend(bytes.fromhex(s[2:]))
+                        else:
+                            buf.extend(s.encode("utf-8"))
+                    else:
+                        # último recurso: to-string y utf8
+                        try:
+                            buf.extend(str(x).encode("utf-8"))
+                        except Exception:
+                            pass
+                data_bytes = bytes(buf)
+            except Exception:
+                raise RuntimeError("anchor ix data inválido: no convertible a bytes (list)")
+        elif isinstance(data_bytes, bytearray):
+            data_bytes = bytes(data_bytes)
+        elif isinstance(data_bytes, memoryview):
+            data_bytes = bytes(data_bytes)
+        elif isinstance(data_bytes, str):
+            # Posibles formatos: "b'..'", hex "0x.." o texto binario; intentos seguros
+            s = data_bytes.strip()
+            if s.startswith("0x"):
+                try:
+                    data_bytes = bytes.fromhex(s[2:])
+                except Exception:
+                    data_bytes = s.encode("utf-8")
+            elif s.startswith("b'") or s.startswith('b"'):
+                try:
+                    data_bytes = eval(s)  # bytes literal; controlado por nuestro código
+                    if not isinstance(data_bytes, (bytes, bytearray)):
+                        data_bytes = str(s).encode("utf-8")
+                except Exception:
+                    data_bytes = s.encode("utf-8")
+            else:
+                data_bytes = s.encode("utf-8")
+
+        # Debug: tipo/tamaño de data antes de construir la instrucción
+        if self.logger.isEnabledFor(logging.INFO):
+            try:
+                sample = None
+                if isinstance(data_bytes, (bytes, bytearray)):
+                    sample = list(data_bytes[:16])
+                self.logger.info("assemble_v0: anchor_ix.data type=%s len=%s sample=%s",
+                                 type(data_bytes).__name__, (len(data_bytes) if hasattr(data_bytes, "__len__") else None), sample)
+            except Exception:
+                pass
+        if not isinstance(prog_id, str) or not keys_desc or not isinstance(data_bytes, (bytes, bytearray)):
+            raise RuntimeError("anchor ix inválida para ensamblar")
+
+        # Compute budget Ixs (helpers + reconstrucción para asegurar bytes)
+        cu_price = int(cb.get("microLamports", 25_000))
+        cu_limit = int(cb.get("units", 600_000))
+        ix_cu_price = None
+        ix_cu_limit = None
+        try:
+            ix_cu_price_h = set_compute_unit_price(cu_price)
+            ix_cu_limit_h = set_compute_unit_limit(cu_limit)
+            ix_cu_price = SInstruction(ix_cu_price_h.program_id, bytes(ix_cu_price_h.data), tuple(ix_cu_price_h.accounts))
+            ix_cu_limit = SInstruction(ix_cu_limit_h.program_id, bytes(ix_cu_limit_h.data), tuple(ix_cu_limit_h.accounts))
+            if self.logger.isEnabledFor(logging.INFO):
+                try:
+                    self.logger.info("assemble_v0: compute helpers OK (price_type=%s, limit_type=%s)", type(ix_cu_price_h.data).__name__, type(ix_cu_limit_h.data).__name__)
+                except Exception:
+                    pass
+        except Exception as exc_cb2:
+            # Fallback manual si los helpers no están disponibles
+            cb_pid = Pubkey.from_string("ComputeBudget111111111111111111111111111111")
+            data_limit_raw = bytes([2]) + int(cu_limit).to_bytes(4, "little", signed=False)
+            data_price_raw = bytes([3]) + int(cu_price).to_bytes(8, "little", signed=False)
+            # Normalización estricta y diagnóstico
+            def _force_bytes(x: Any) -> bytes:
+                if isinstance(x, (bytes, bytearray)):
+                    return bytes(x)
+                if isinstance(x, list):
+                    return bytes(bytearray((int(v) & 0xFF) for v in x))
+                if isinstance(x, memoryview):
+                    return bytes(x)
+                if isinstance(x, int):
+                    return bytes([x & 0xFF])
+                try:
+                    return bytes(x)
+                except Exception:
+                    return bytes(str(x), "utf-8")
+            data_limit_b = _force_bytes(data_limit_raw)
+            data_price_b = _force_bytes(data_price_raw)
+            if self.logger.isEnabledFor(logging.INFO):
+                try:
+                    self.logger.info("assemble_v0: cb manual types (limit=%s, price=%s) lens=(%s,%s)", type(data_limit_b).__name__, type(data_price_b).__name__, len(data_limit_b), len(data_price_b))
+                except Exception:
+                    pass
+            try:
+                ix_cu_limit = SInstruction(cb_pid, data_limit_b, tuple(()))
+                ix_cu_price = SInstruction(cb_pid, data_price_b, tuple(()))
+            except Exception as exc_manual:
+                if self.logger.isEnabledFor(logging.ERROR):
+                    try:
+                        self.logger.error("assemble_v0: compute manual build failed: %s (limit_len=%s price_len=%s)", exc_manual, len(data_limit_b), len(data_price_b))
+                    except Exception:
+                        pass
+                ix_cu_limit = None
+                ix_cu_price = None
+            if self.logger.isEnabledFor(logging.WARNING):
+                try:
+                    self.logger.warning(
+                        "assemble_v0: compute helpers fallback: price_len=%s limit_len=%s",
+                        len(data_price_b), len(data_limit_b)
+                    )
+                except Exception:
+                    pass
+        if self.logger.isEnabledFor(logging.INFO):
+            try:
+                self.logger.info("assemble_v0: compute budget ixs listos (price=%d, limit=%d) present=(%s,%s)", cu_price, cu_limit, bool(ix_cu_price), bool(ix_cu_limit))
+            except Exception:
+                pass
+
+        # Anchor ix principal
+        def to_meta(k: Dict[str, Any]) -> AccountMeta:
+            pk = Pubkey.from_string(k.get("pubkey"))
+            return AccountMeta(pk, bool(k.get("is_signer")), bool(k.get("is_writable")))
+        metas = [to_meta(k) for k in keys_desc if isinstance(k, dict) and k.get("pubkey")]
+        program_pk = Pubkey.from_string(prog_id)
+        try:
+            anchor_ix = SInstruction(program_pk, bytes(data_bytes), tuple(metas))
+        except Exception as exc_ix:
+            try:
+                meta_dump = [{"pubkey": str(m.pubkey), "is_signer": m.is_signer, "is_writable": m.is_writable} for m in metas]
+                self.logger.error("assemble_v0: fallo creando anchor_ix: %s | program=%s data_type=%s data_len=%s metas=%s",
+                                  exc_ix,
+                                  str(program_pk),
+                                  type(data_bytes).__name__,
+                                  (len(data_bytes) if hasattr(data_bytes, "__len__") else None),
+                                  meta_dump)
+            except Exception:
+                pass
+            raise
+        if self.logger.isEnabledFor(logging.INFO):
+            try:
+                self.logger.info("assemble_v0: anchor_ix creado OK (program=%s data_len=%s)", str(program_pk), len(bytes(data_bytes)))
+            except Exception:
+                pass
+
+        # Ensamblar mensaje V0
+        recent_blockhash = self._get_latest_blockhash()
+        payer_pk = Pubkey.from_string(self.owner_pubkey)
+        # Build create ATA + wrap/unwrap ixs usando ATA, Token y System Program
+        sys_program = Pubkey.from_string("11111111111111111111111111111111")
+        token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        wsol_mint = Pubkey.from_string(self.SOL_MINT)
+        ata_program = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+        wrap_ixs: List[Any] = []
+        # 0) Create ATAs que falten
+        def _try_build_create_ata(owner_str: str, mint_str: str) -> Optional[Any]:
+            # Construir manualmente la ix de creación de ATA (datos vacíos)
+            try:
+                owner_pk = Pubkey.from_string(owner_str)
+                mint_pk = Pubkey.from_string(mint_str)
+                ata_str = self._derive_ata(owner_str, mint_str)
+                if not ata_str:
+                    return None
+                ata_pk = Pubkey.from_string(ata_str)
+                rent_pk = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+                metas = [
+                    AccountMeta(payer_pk, True, True),        # payer (signer, writable)
+                    AccountMeta(ata_pk, False, True),         # associated token account (writable)
+                    AccountMeta(owner_pk, False, False),      # owner
+                    AccountMeta(mint_pk, False, False),       # mint
+                    AccountMeta(sys_program, False, False),   # system program
+                    AccountMeta(token_program, False, False), # token program
+                    AccountMeta(rent_pk, False, False),       # rent sysvar
+                ]
+                return SInstruction(ata_program, b"", tuple(metas))
+            except Exception:
+                return None
+        for ca in create_atas:
+            try:
+                owner_str = ca.get("owner")
+                mint_str = ca.get("mint")
+                ix = _try_build_create_ata(owner_str, mint_str)
+                if ix:
+                    wrap_ixs.append(ix)
+                    if self.logger.isEnabledFor(logging.INFO):
+                        try:
+                            data = getattr(ix, "data", None)
+                            self.logger.info("assemble_v0: create_ata ix añadido (owner=%s mint=%s) data_type=%s", owner_str, mint_str, (type(data).__name__ if data is not None else None))
+                        except Exception:
+                            pass
+            except Exception:
+                continue
+        # 1) Wraps (transfer + syncNative). La creación de ATA ya se programa en create_atas.
+        for w in prewrap:
+            try:
+                ata_pk = Pubkey.from_string(w.get("ata"))
+                lamports = int(w.get("lamports", 0))
+                # transfer lamports al ATA WSOL (SOL->ATA)
+                from solders.system_program import transfer, TransferParams  # type: ignore
+                ix_tr = transfer(TransferParams(from_pubkey=payer_pk, to_pubkey=ata_pk, lamports=lamports))
+                wrap_ixs.append(ix_tr)
+                if self.logger.isEnabledFor(logging.INFO):
+                    try:
+                        self.logger.info("assemble_v0: wrap transfer ix añadido (lamports=%d)", lamports)
+                    except Exception:
+                        pass
+                # syncNative (manual): tag 17, cuentas: [account]
+                ix_sn = SInstruction(token_program, bytes([17]), tuple([AccountMeta(ata_pk, False, True)]))
+                wrap_ixs.append(ix_sn)
+                if self.logger.isEnabledFor(logging.INFO):
+                    try:
+                        data = getattr(ix_sn, "data", None)
+                        self.logger.info("assemble_v0: wrap sync_native ix añadido data_type=%s", (type(data).__name__ if data is not None else None))
+                    except Exception:
+                        pass
+            except Exception as exc:
+                if self.logger.isEnabledFor(logging.ERROR):
+                    try:
+                        self.logger.error("assemble_v0: error añadiendo wrap (transfer+sync): %s", exc)
+                    except Exception:
+                        pass
+                continue
+        # Fallback de seguridad: si hay prewrap pero no se añadió transfer/syncNative, forzarlos
+        try:
+            have_transfer = False
+            have_sync = False
+            for ix in wrap_ixs:
+                try:
+                    pid = getattr(ix, "program_id", None)
+                    if pid is not None and str(pid) == str(sys_program):
+                        have_transfer = True
+                    if pid is not None and str(pid) == str(token_program):
+                        # Puede ser syncNative o create ATA; distinguimos por data tag si posible
+                        data = getattr(ix, "data", b"")
+                        tag = None
+                        try:
+                            tag = int(data[0]) if isinstance(data, (bytes, bytearray)) and len(data) > 0 else None
+                        except Exception:
+                            tag = None
+                        if tag == 17:
+                            have_sync = True
+                except Exception:
+                    continue
+            if prewrap and not (have_transfer and have_sync):
+                # Tomar el primer prewrap y crear transfer+syncNative
+                for w in prewrap:
+                    try:
+                        ata_pk = Pubkey.from_string(w.get("ata"))
+                        lamports = int(w.get("lamports", 0))
+                        if lamports <= 0:
+                            continue
+                        from solders.system_program import transfer, TransferParams  # type: ignore
+                        ix_tr = transfer(TransferParams(from_pubkey=payer_pk, to_pubkey=ata_pk, lamports=lamports))
+                        wrap_ixs.append(ix_tr)
+                        ix_sn = SInstruction(token_program, bytes([17]), tuple([AccountMeta(ata_pk, False, True)]))
+                        wrap_ixs.append(ix_sn)
+                        if self.logger.isEnabledFor(logging.INFO):
+                            try:
+                                self.logger.info("assemble_v0: fallback wrap (transfer+syncNative) añadido (lamports=%d)", lamports)
+                            except Exception:
+                                pass
+                        break
+                    except Exception as exc:
+                        if self.logger.isEnabledFor(logging.ERROR):
+                            try:
+                                self.logger.error("assemble_v0: fallback wrap error: %s", exc)
+                            except Exception:
+                                pass
+                        continue
+        except Exception:
+            pass
+        unwrap_ixs: List[Any] = []
+        for u in postunwrap:
+            try:
+                ata_pk = Pubkey.from_string(u.get("ata"))
+                # closeAccount(owner recibe lamports)
+                # close_account (manual): tag 9, cuentas: [account(w), destination(w), owner(s)]
+                metas = [
+                    AccountMeta(ata_pk, False, True),
+                    AccountMeta(payer_pk, False, True),
+                    AccountMeta(payer_pk, True, False),
+                ]
+                ix_ca = SInstruction(token_program, bytes([9]), tuple(metas))
+                unwrap_ixs.append(ix_ca)
+                if self.logger.isEnabledFor(logging.INFO):
+                    try:
+                        data = getattr(ix_ca, "data", None)
+                        self.logger.info("assemble_v0: unwrap close_account ix añadido data_type=%s", (type(data).__name__ if data is not None else None))
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        def _ensure_solders_ix(ix: Any) -> SInstruction:
+            # Si ya es solders Instruction, reempaquetar garantizando bytes en data
+            if isinstance(ix, SInstruction):
+                db = ix.data
+                if isinstance(db, (bytes, bytearray)):
+                    dbb = bytes(db)
+                elif isinstance(db, list):
+                    try:
+                        dbb = bytes(bytearray(int(x) & 0xFF for x in db))
+                    except Exception:
+                        dbb = bytes(str(db), "utf-8")
+                elif isinstance(db, memoryview):
+                    dbb = bytes(db)
+                else:
+                    try:
+                        dbb = bytes(db)
+                    except Exception:
+                        dbb = bytes(str(db), "utf-8")
+                return SInstruction(ix.program_id, dbb, tuple(ix.accounts))
+            # Intentar reconstruir desde objetos similares (solana-py)
+            try:
+                prog = getattr(ix, "program_id", None) or getattr(ix, "programId", None)
+                keys = getattr(ix, "accounts", None) or getattr(ix, "keys", None)
+                data = getattr(ix, "data", None)
+                if prog is None or keys is None:
+                    raise RuntimeError("ix incompatible: falta program_id o keys")
+                # program id a Pubkey
+                if isinstance(prog, str):
+                    prog_pk = Pubkey.from_string(prog)
+                else:
+                    prog_pk = Pubkey.from_string(str(prog))
+                # keys a AccountMeta
+                metas: List[AccountMeta] = []
+                for k in list(keys):
+                    if isinstance(k, dict):
+                        pk_str = str(k.get("pubkey")) if k.get("pubkey") is not None else None
+                        is_signer = bool(k.get("is_signer") or k.get("isSigner") or False)
+                        is_writable = bool(k.get("is_writable") or k.get("isWritable") or False)
+                    else:
+                        pk = getattr(k, "pubkey", None)
+                        pk_str = str(pk) if pk is not None else None
+                        is_signer = getattr(k, "is_signer", None)
+                        if is_signer is None:
+                            is_signer = getattr(k, "isSigner", False)
+                        is_writable = getattr(k, "is_writable", None)
+                        if is_writable is None:
+                            is_writable = getattr(k, "isWritable", False)
+                    if not pk_str:
+                        raise RuntimeError("account meta inválido en ix externo")
+                    metas.append(AccountMeta(Pubkey.from_string(pk_str), bool(is_signer), bool(is_writable)))
+                # data a bytes
+                db = b""
+                if data is None:
+                    db = b""
+                elif isinstance(data, (bytes, bytearray)):
+                    db = bytes(data)
+                elif isinstance(data, list):
+                    buf = bytearray()
+                    for x in data:
+                        if isinstance(x, int):
+                            buf.append(x & 0xFF)
+                        elif isinstance(x, (bytes, bytearray)):
+                            buf.extend(x)
+                        elif isinstance(x, str):
+                            s = x.strip()
+                            if s.startswith("0x"):
+                                buf.extend(bytes.fromhex(s[2:]))
+                            else:
+                                buf.extend(s.encode("utf-8"))
+                        else:
+                            buf.extend(bytes(str(x), "utf-8"))
+                    db = bytes(buf)
+                elif isinstance(data, str):
+                    s = data.strip()
+                    if s.startswith("0x"):
+                        try:
+                            db = bytes.fromhex(s[2:])
+                        except Exception:
+                            db = s.encode("utf-8")
+                    else:
+                        db = s.encode("utf-8")
+                else:
+                    db = bytes(str(data), "utf-8")
+                ins = SInstruction(prog_pk, db, tuple(metas))
+                if self.logger.isEnabledFor(logging.INFO):
+                    try:
+                        self.logger.info("ensure_solders_ix: program=%s metas=%d data_len=%d", str(prog_pk), len(metas), len(db))
+                    except Exception:
+                        pass
+                return ins
+            except Exception as exc:
+                raise RuntimeError(f"No se pudo convertir ix a solders: {exc}")
+
+        all_ixs_raw = ([] if ix_cu_price is None else [ix_cu_price]) + ([] if ix_cu_limit is None else [ix_cu_limit]) + wrap_ixs + [anchor_ix] + unwrap_ixs
+        # Detección temprana: identificar cualquier ix cuya data sea list
+        try:
+            for i, ix in enumerate(all_ixs_raw):
+                prog = getattr(ix, "program_id", None) or getattr(ix, "programId", None)
+                data = getattr(ix, "data", None)
+                if isinstance(data, list):
+                    head = None
+                    try:
+                        head = str(data[:12])
+                    except Exception:
+                        head = None
+                    self.logger.error("assemble_v0 detect: list data at raw index %d program=%s head=%s", i, (str(prog) if prog is not None else type(ix).__name__), head)
+        except Exception:
+            pass
+        if self.logger.isEnabledFor(logging.INFO):
+            try:
+                dump_raw = []
+                for i, ix in enumerate(all_ixs_raw):
+                    prog = getattr(ix, "program_id", None) or getattr(ix, "programId", None)
+                    data = getattr(ix, "data", None)
+                    dump_raw.append({
+                        "i": i,
+                        "program": (str(prog) if prog is not None else type(ix).__name__),
+                        "data_type": (type(data).__name__ if data is not None else None),
+                    })
+                self.logger.info("assemble_v0 raw ixs: %s", dump_raw)
+            except Exception:
+                pass
+        # Convertir ixs una a una para identificar exactamente cuál falla y por qué
+        all_ixs = []
+        for i, ix in enumerate(all_ixs_raw):
+            # Si ya es solders.Instruction, NO lo reconstruyas; úsalo tal cual
+            try:
+                from solders.instruction import Instruction as SoldersInstruction  # type: ignore
+            except Exception:
+                SoldersInstruction = None  # type: ignore
+            is_solders = (SoldersInstruction is not None and isinstance(ix, SoldersInstruction))
+            if is_solders:
+                if self.logger.isEnabledFor(logging.INFO):
+                    try:
+                        raw_prog = getattr(ix, "program_id", None)
+                        raw_data = getattr(ix, "data", None)
+                        self.logger.info("assemble_v0 keep ix[%d]: program=%s data_type=%s", i, (str(raw_prog) if raw_prog is not None else type(ix).__name__), (type(raw_data).__name__ if raw_data is not None else None))
+                    except Exception:
+                        pass
+                all_ixs.append(ix)
+                continue
+            # Caso contrario, convertimos
+            try:
+                raw_prog = getattr(ix, "program_id", None) or getattr(ix, "programId", None)
+                raw_data = getattr(ix, "data", None)
+                if self.logger.isEnabledFor(logging.INFO):
+                    try:
+                        dt = type(raw_data).__name__ if raw_data is not None else None
+                        dl = (len(raw_data) if hasattr(raw_data, "__len__") else None)
+                        self.logger.info("assemble_v0 pre-convert ix[%d]: program=%s data_type=%s data_len=%s", i, (str(raw_prog) if raw_prog is not None else type(ix).__name__), dt, dl)
+                    except Exception:
+                        pass
+                all_ixs.append(_ensure_solders_ix(ix))
+            except Exception as exc:
+                try:
+                    keys = getattr(ix, "accounts", None) or getattr(ix, "keys", None)
+                    klen = len(keys) if keys is not None and hasattr(keys, "__len__") else None
+                    self.logger.error("ensure_solders_ix failed at index %d: %s | program=%s keys=%s data_type=%s data_repr_head=%s",
+                                      i,
+                                      exc,
+                                      (str(raw_prog) if raw_prog is not None else type(ix).__name__),
+                                      klen,
+                                      (type(raw_data).__name__ if raw_data is not None else None),
+                                      (str(raw_data)[:120] if raw_data is not None else None))
+                except Exception:
+                    pass
+                raise
+        try:
+            # Uso posicional: (payer, instructions, address_lookup_table_accounts, recent_blockhash)
+            rb = SolHash.from_string(recent_blockhash) if isinstance(recent_blockhash, str) else recent_blockhash
+            msg = MessageV0.try_compile(payer_pk, all_ixs, [], rb)
+        except Exception as exc:
+            # Construir blob de depuración con ixs crudas y convertidas
+            debug_blob: Dict[str, Any] = {"raw": [], "converted": []}
+            try:
+                for i, ix in enumerate(all_ixs_raw):
+                    prog = getattr(ix, "program_id", None) or getattr(ix, "programId", None)
+                    data = getattr(ix, "data", None)
+                    debug_blob["raw"].append({
+                        "i": i,
+                        "cls": type(ix).__name__,
+                        "program": (str(prog) if prog is not None else None),
+                        "data_type": (type(data).__name__ if data is not None else None),
+                        "data_len": (len(data) if hasattr(data, "__len__") else None),
+                    })
+            except Exception:
+                pass
+            try:
+                for i, ix in enumerate(all_ixs):
+                    dt = type(getattr(ix, "data", None)).__name__
+                    dl = len(getattr(ix, "data", b"")) if hasattr(getattr(ix, "data", b""), "__len__") else None
+                    debug_blob["converted"].append({
+                        "i": i,
+                        "program": str(getattr(ix, "program_id", None)),
+                        "data_type": dt,
+                        "data_len": dl,
+                    })
+            except Exception:
+                pass
+            if self.logger.isEnabledFor(logging.ERROR):
+                try:
+                    self.logger.error("assemble_v0 compile failed: %s debug=%s", exc, json.dumps(debug_blob, ensure_ascii=False))
+                except Exception:
+                    pass
+            raise RuntimeError(f"assemble_v0 compile failed: {exc}")
+        # En esta fase devolvemos el MessageV0 serializado (no firmado).
+        # El firmado se realiza en swap_send reconstruyendo VersionedTransaction(msg, keypairs).
+        # Extra signers (mint del NFT) provienen de anchor.ix.signers
+        extras: List[str] = []
+        try:
+            ix_signers_map = ((anc.get("anchor") or {}).get("ix") or {}).get("signers") or {}
+            if isinstance(ix_signers_map, dict):
+                for _, s_b64 in ix_signers_map.items():
+                    if isinstance(s_b64, str):
+                        extras.append(s_b64)
+        except Exception:
+            pass
+        # Devuelve tx sin firmar en base64 (la firma se hace en swap_send)
+        if self.logger.isEnabledFor(logging.INFO):
+            try:
+                self.logger.info(
+                    "assemble_v0: ixs(cu+wrap+anchor+unwrap)=%d, prewrap=%d, postunwrap=%d, createATAs=%d",
+                    2 + len(wrap_ixs) + 1 + len(unwrap_ixs), len(prewrap), len(postunwrap), len(create_atas),
+                )
+            except Exception:
+                pass
+        tx_b64 = __import__("base64").b64encode(bytes(msg)).decode("utf-8")
+        return tx_b64, extras
+
     def swap_send(self, prep: Dict[str, Any], wait: bool = True) -> Dict[str, Any]:
         try:
             from solana.rpc.api import Client  # type: ignore
             from solana.rpc.types import TxOpts  # type: ignore
             from solders.transaction import VersionedTransaction  # type: ignore
             from solders.signature import Signature as SolSig  # type: ignore
+            from solders.keypair import Keypair  # type: ignore
         except Exception as exc:
             raise RuntimeError(f"Faltan dependencias para V0: {exc}")
 
@@ -287,16 +1545,85 @@ class RaydiumAdapter:
                 return str(obj)
             except Exception:
                 return None
+        extra_signers: List[Any] = []
+        try:
+            # 1) Preferir extraSigners planos en prep
+            flat_extras = prep.get("extraSigners") or []
+            # 2) Respaldo: si vienen dentro de prep.anchor.signers (dict name->b64)
+            if not flat_extras:
+                anchor_sign_map = ((prep.get("anchor") or {}).get("signers") or {})
+                if isinstance(anchor_sign_map, dict):
+                    flat_extras = list(anchor_sign_map.values())
+            for s in flat_extras:
+                try:
+                    raw = __import__("base64").b64decode(str(s))
+                    extra_signers.append(Keypair.from_bytes(raw))
+                except Exception:
+                    continue
+        except Exception:
+            pass
         for tx_b64 in prep.get("transactions", []):
             raw = __import__("base64").b64decode(tx_b64)
             sig = None
             try:
-                vtx = VersionedTransaction.from_bytes(raw)
-                # Firmar la transacción con nuestro keypair
-                msg = vtx.message
-                signed_vtx = VersionedTransaction(msg, [kp])
+                # Intentar interpretar como VersionedTransaction completa
+                vtx = None
+                try:
+                    vtx = VersionedTransaction.from_bytes(raw)
+                except Exception:
+                    vtx = None
+                # Si no es una tx, interpretar como MessageV0 y construir tx firmable
+                if vtx is None:
+                    try:
+                        from solders.message import MessageV0  # type: ignore
+                        msg = MessageV0.from_bytes(raw)
+                        # Construir lista de firmantes exacta y ordenada según el mensaje
+                        ordered_signers = []
+                        try:
+                            hdr = getattr(msg, "header", None)
+                            num_req = int(getattr(hdr, "num_required_signatures", 0)) if hdr is not None else 0
+                            # Mapa pubkey->Keypair disponible
+                            signer_map = {str(kp.pubkey()): kp}
+                            for ex in (extra_signers or []):
+                                try:
+                                    signer_map[str(ex.pubkey())] = ex
+                                except Exception:
+                                    continue
+                            # Obtener claves estáticas (ordenadas) y tomar las primeras num_req
+                            static_keys = []
+                            try:
+                                static_keys = [str(pk) for pk in list(getattr(msg, "static_account_keys", []) or [])]
+                            except Exception:
+                                static_keys = []
+                            if not static_keys:
+                                # Fallback: usar payer y luego extras hasta num_req
+                                ordered_signers = [kp] + list((extra_signers or []))
+                                if num_req > 0:
+                                    ordered_signers = ordered_signers[:num_req]
+                            else:
+                                required_keys = static_keys[:num_req] if num_req > 0 else []
+                                for sk in required_keys:
+                                    s = signer_map.get(sk)
+                                    if s is None:
+                                        # Si falta, usar payer como último recurso para la primera posición
+                                        if sk == str(kp.pubkey()):
+                                            s = kp
+                                    if s is not None:
+                                        ordered_signers.append(s)
+                                # Asegurar longitud exacta
+                                if num_req > 0 and len(ordered_signers) > num_req:
+                                    ordered_signers = ordered_signers[:num_req]
+                                if num_req > 0 and len(ordered_signers) < num_req and self.logger.isEnabledFor(logging.ERROR):
+                                    self.logger.error("firmado insuficiente tras ordenar: required=%d provided=%d", num_req, len(ordered_signers))
+                        except Exception:
+                            # Fallback simple
+                            ordered_signers = [kp] + list((extra_signers or []))
+                        vtx = VersionedTransaction(msg, ordered_signers)
+                    except Exception as exc_build:
+                        raise RuntimeError(f"No se pudo construir VersionedTransaction desde message: {exc_build}")
+                # Enviar
                 opts = TxOpts(skip_preflight=True, preflight_commitment="confirmed")
-                resp = client.send_raw_transaction(bytes(signed_vtx), opts=opts)
+                resp = client.send_raw_transaction(bytes(vtx), opts=opts)
                 sig = _extract_sig(resp)
             except Exception as exc:
                 self.logger.error("Error enviando transacción v0: %s", exc)
@@ -418,6 +1745,652 @@ class RaydiumAdapter:
         pda, bump = Pubkey.find_program_address([b"position", bytes(mint_pk)], program)
         return str(pda), bump
 
+    # ---------------- CLMM PDA helpers ----------------
+    def _tick_array_span(self) -> int:
+        """Número de ticks por TickArray (Raydium CLMM usa 60 en mainnet WSOL/USDC)."""
+        return 60
+
+    def compute_tick_array_start_index(self, tick_index: int, tick_spacing: int) -> int:
+        """Calcula el start_index del TickArray que contiene tick_index.
+        start = floor(tick_index / (tick_spacing * span)) * (tick_spacing * span)
+        """
+        span = self._tick_array_span()
+        unit = int(tick_spacing) * int(span)
+        if unit <= 0:
+            raise ValueError("tick_spacing inválido para tick array")
+        # División entera hacia menos infinito para tick negativos
+        if tick_index >= 0:
+            q = tick_index // unit
+        else:
+            # Asegura que -1 -> -1, -unit-1 -> -2, etc.
+            q = -((-tick_index + unit - 1) // unit)
+        return q * unit
+
+    def _compute_tick_array_start_index_span(self, tick_index: int, tick_spacing: int, span: int) -> int:
+        unit = int(tick_spacing) * int(span)
+        if unit <= 0:
+            raise ValueError("tick_spacing inválido para tick array")
+        if tick_index >= 0:
+            q = tick_index // unit
+        else:
+            q = -((-tick_index + unit - 1) // unit)
+        return q * unit
+
+    def _find_existing_tick_array_pda(self, pool_id: str, tick_index: int, tick_spacing: int) -> str:
+        # Mantener consistencia: usar el span oficial (88)
+        sp = self._tick_array_span()
+        try:
+            start_idx = self._compute_tick_array_start_index_span(tick_index, tick_spacing, sp)
+            addr, _ = self.derive_tick_array_pda(pool_id, start_idx)
+            # Preferimos coincidir seeds aunque no exista aún on-chain
+            return addr
+        except Exception:
+            # Fallback mínimo y consistente
+            return self.derive_tick_array_pda(pool_id, 0)[0]
+
+    def derive_tick_array_pda(self, pool_id: str, start_index: int) -> Tuple[str, int]:
+        """PDA de tick array.
+        Prueba prefijos ("tick_array" | "tickarray"), órdenes ([prefix, pool, i32] | [prefix, i32, pool])
+        y endianness (LE | BE). Devuelve la primera que exista on-chain, con fallback estable.
+        """
+        try:
+            from solders.pubkey import Pubkey  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("Falta dependencia 'solders'. Instala con: pip install solders") from exc
+        program = Pubkey.from_string(self.config.program_id_clmm)
+        pool_pk = Pubkey.from_string(pool_id)
+        si = int(start_index)
+        si_le = si.to_bytes(4, byteorder="little", signed=True)
+        si_be = si.to_bytes(4, byteorder="big", signed=True)
+        prefixes = [b"tick_array", b"tickarray"]
+        orders = [
+            lambda pref, pk, idx: [pref, bytes(pk), idx],
+            lambda pref, pk, idx: [pref, idx, bytes(pk)],
+        ]
+        idx_bytes = [(si_le, "le"), (si_be, "be")]
+        candidates: List[Tuple[str, int, bytes, str, str]] = []
+        # Construir todas las variantes
+        for pref in prefixes:
+            for order in orders:
+                for bts, endian in idx_bytes:
+                    seeds = order(pref, pool_pk, bts)
+                    pda, bump = Pubkey.find_program_address(seeds, program)
+                    candidates.append((str(pda), bump, pref, "pool_idx" if order is orders[0] else "idx_pool", endian))
+        # Seleccionar la primera que exista on-chain
+        for addr, bump, pref, order_tag, endian in candidates:
+            try:
+                if self._get_account_info_base64(addr):
+                    try:
+                        self.logger.debug("tick_array PDA match on-chain addr=%s pref=%s order=%s endian=%s start=%s", addr, pref.decode(), order_tag, endian, si)
+                    except Exception:
+                        pass
+                    return addr, bump
+            except Exception:
+                continue
+        # Fallback preferente: prefijo sin guion bajo, orden [pref, pool, i32_le]
+        seeds_fallback = [b"tickarray", bytes(pool_pk), si_le]
+        pda_fb, bump_fb = Pubkey.find_program_address(seeds_fallback, program)
+        try:
+            self.logger.debug("tick_array PDA fallback addr=%s start=%s", str(pda_fb), si)
+        except Exception:
+            pass
+        return str(pda_fb), bump_fb
+
+    def derive_protocol_position_pda(self, pool_id: str, tick_lower: int, tick_upper: int) -> Tuple[str, int]:
+        """PDA de protocol position.
+        Prueba prefijos ("protocol_position" | "protocolposition") y endianness (LE | BE)
+        para los índices lower/upper. Devuelve la primera que exista on-chain.
+        """
+        try:
+            from solders.pubkey import Pubkey  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("Falta dependencia 'solders'. Instala con: pip install solders") from exc
+        program = Pubkey.from_string(self.config.program_id_clmm)
+        pool_pk = Pubkey.from_string(pool_id)
+        lo = int(tick_lower)
+        hi = int(tick_upper)
+        lo_le = lo.to_bytes(4, byteorder="little", signed=True)
+        hi_le = hi.to_bytes(4, byteorder="little", signed=True)
+        lo_be = lo.to_bytes(4, byteorder="big", signed=True)
+        hi_be = hi.to_bytes(4, byteorder="big", signed=True)
+        prefixes = [b"protocol_position", b"protocolposition"]
+        idx_pairs = [(lo_le, hi_le, "le"), (lo_be, hi_be, "be")]
+        candidates: List[Tuple[str, int, bytes, str]] = []
+        for pref in prefixes:
+            for lo_b, hi_b, endian in idx_pairs:
+                seeds = [pref, bytes(pool_pk), lo_b, hi_b]
+                pda, bump = Pubkey.find_program_address(seeds, program)
+                candidates.append((str(pda), bump, pref, endian))
+        for addr, bump, pref, endian in candidates:
+            try:
+                if self._get_account_info_base64(addr):
+                    try:
+                        self.logger.debug("protocol_position PDA match on-chain addr=%s pref=%s endian=%s lo=%s hi=%s", addr, pref.decode(), endian, lo, hi)
+                    except Exception:
+                        pass
+                    return addr, bump
+            except Exception:
+                continue
+        # Fallback: prefijo estándar y LE
+        seeds_fb = [b"protocol_position", bytes(pool_pk), lo_le, hi_le]
+        pda_fb, bump_fb = Pubkey.find_program_address(seeds_fb, program)
+        try:
+            self.logger.debug("protocol_position PDA fallback addr=%s lo=%s hi=%s", str(pda_fb), lo, hi)
+        except Exception:
+            pass
+        return str(pda_fb), bump_fb
+
+    def get_pool_state_decoded(self, pool_id: str) -> Dict[str, Any]:
+        """Lee y decodifica la cuenta PoolState on-chain."""
+        b64 = self._get_account_info_base64(pool_id)
+        if not b64:
+            raise RuntimeError(f"Cuenta de pool no encontrada: {pool_id}")
+        return self._decode_account("PoolState", pool_id, b64) or {}
+
+    def get_pool_vaults(self, pool_state: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Extrae direcciones de vaults A/B desde el estado de la pool, tolerando nombres alternativos."""
+        if not isinstance(pool_state, dict):
+            return None, None
+        for k0, k1 in (
+            ("token_vault_0", "token_vault_1"),
+            ("tokenVault0", "tokenVault1"),
+            ("vault_0", "vault_1"),
+            ("vaultA", "vaultB"),
+        ):
+            v0 = pool_state.get(k0)
+            v1 = pool_state.get(k1)
+            if isinstance(v0, str) and isinstance(v1, str):
+                return v0, v1
+        return None, None
+
+    def get_pool_mints(self, pool_state: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Extrae mints 0/1 desde el estado de la pool, tolerando nombres alternativos."""
+        if not isinstance(pool_state, dict):
+            return None, None
+        # Chequear claves comunes
+        candidates = [
+            ("token_mint_0", "token_mint_1"),
+            ("tokenMint0", "tokenMint1"),
+            ("mint0", "mint1"),
+            ("mintA", "mintB"),
+        ]
+        for k0, k1 in candidates:
+            m0 = pool_state.get(k0)
+            m1 = pool_state.get(k1)
+            if isinstance(m0, str) and isinstance(m1, str):
+                return m0, m1
+        return None, None
+
+    # ---------------- Anchor/Borsh encoders ----------------
+    def _anchor_discriminator(self, ix_name: str) -> bytes:
+        import hashlib
+        h = hashlib.sha256(f"global:{ix_name}".encode("utf-8")).digest()
+        return h[:8]
+
+    def _encode_i32_le(self, val: int) -> bytes:
+        return int(val).to_bytes(4, byteorder="little", signed=True)
+
+    def _encode_u64_le(self, val: int) -> bytes:
+        return int(val).to_bytes(8, byteorder="little", signed=False)
+
+    def _encode_u128_le(self, val: int) -> bytes:
+        return int(val).to_bytes(16, byteorder="little", signed=False)
+
+    def _encode_bool(self, val: bool) -> bytes:
+        return b"\x01" if bool(val) else b"\x00"
+
+    def _encode_option_bool(self, val: Optional[bool]) -> bytes:
+        if val is None:
+            return b"\x00"
+        return b"\x01" + self._encode_bool(bool(val))
+
+    # ---------------- Build CLMM instructions (Anchor) ----------------
+    def build_open_position_with_token22_ix(
+        self,
+        pool_id: str,
+        mintA: str,
+        mintB: str,
+        tick_lower: int,
+        tick_upper: int,
+        amount0_max: int,
+        amount1_max: int,
+        with_metadata: bool = True,
+        base_flag: Optional[bool] = False,
+        tick_spacing_hint: Optional[int] = None,
+        token_account_a: Optional[str] = None,
+        token_account_b: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Construye estructura de instrucción Anchor para open_position_with_token22_nft.
+        NOTA: requiere firmar también con un keypair efímero para el mint del NFT de posición.
+        Devuelve dict con: {program_id, keys:[{pubkey,is_signer,is_writable}], data(bytes), signers:{mint:priv_b64}, accounts:{...}}
+        """
+        # 1) Estado de pool, spacing y vaults
+        pool_state = self.get_pool_state_decoded(pool_id)
+        # Determinar tickSpacing
+        spacing = None
+        for k in ("tick_spacing", "tickSpacing", "tick_spacing_index"):
+            if pool_state.get(k) is not None:
+                try:
+                    spacing = int(pool_state.get(k)); break
+                except Exception:
+                    pass
+        if spacing is None and tick_spacing_hint is not None:
+            spacing = int(tick_spacing_hint)
+        if spacing is None:
+            raise RuntimeError("No se pudo determinar tickSpacing de la pool")
+        vault0, vault1 = self.get_pool_vaults(pool_state)
+        if not vault0 or not vault1:
+            raise RuntimeError("No se pudieron determinar los vaults de la pool")
+        mint0, mint1 = self.get_pool_mints(pool_state)
+
+        # 2) Tick arrays
+        start_lo = self.compute_tick_array_start_index(tick_lower, spacing)
+        start_hi = self.compute_tick_array_start_index(tick_upper, spacing)
+        # Derivar PDAs exactamente a partir de los start_index usados en la instrucción
+        ta_lo, _ = self.derive_tick_array_pda(pool_id, start_lo)
+        ta_hi, _ = self.derive_tick_array_pda(pool_id, start_hi)
+
+        # 3) Position NFT mint (efímero)
+        try:
+            from solders.keypair import Keypair  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(f"Falta dependencia solders: {exc}")
+        mint_kp = Keypair()
+        mint_pub = str(mint_kp.pubkey())
+        # Personal position PDA
+        personal_pos, _b = self._derive_personal_position_pda(mint_pub)
+        # Protocol position PDA
+        proto_pos, _pb = self.derive_protocol_position_pda(pool_id, tick_lower, tick_upper)
+
+        # 4) Cuentas de entrada del usuario (token accounts)
+        # Requerimos ATAs existentes para ambos mints (sin auto-wrap aquí)
+        ata_a = token_account_a or (self._derive_ata(self.owner_pubkey, mintA) if not self._is_sol_mint(mintA) else None)
+        ata_b = token_account_b or (self._derive_ata(self.owner_pubkey, mintB) if not self._is_sol_mint(mintB) else None)
+        # Si alguno es SOL nativo, pedimos pre-wrap en notas (no gestionamos temp WSOL en esta versión)
+        notes: List[str] = []
+        if self._is_sol_mint(mintA):
+            notes.append("mintA es SOL: pre-wrap a WSOL ATA y pásalo como Token Account 0")
+        if self._is_sol_mint(mintB):
+            notes.append("mintB es SOL: pre-wrap a WSOL ATA y pásalo como Token Account 1")
+        if not ata_a and not self._is_sol_mint(mintA):
+            notes.append("ATA de token A ausente")
+        if not ata_b and not self._is_sol_mint(mintB):
+            notes.append("ATA de token B ausente")
+
+        # 5) Datos Borsh (Anchor) para la instrucción
+        ix_name = "open_position_with_token22_nft"
+        data = b"".join([
+            self._anchor_discriminator(ix_name),
+            self._encode_i32_le(int(tick_lower)),
+            self._encode_i32_le(int(tick_upper)),
+            self._encode_i32_le(int(start_lo)),
+            self._encode_i32_le(int(start_hi)),
+            self._encode_u128_le(0),  # liquidity=0 (program calcula por amounts max)
+            self._encode_u64_le(int(amount0_max)),
+            self._encode_u64_le(int(amount1_max)),
+            self._encode_bool(bool(with_metadata)),
+            self._encode_option_bool(base_flag),
+        ])
+
+        # 6) Claves: construir en el orden exacto del IDL
+        schema = self.decoder.get_instruction_schema("open_position_with_token22_nft")
+        acc_list = (schema.get("accounts") or []) if isinstance(schema, dict) else []
+        # Derivaciones auxiliares
+        rent_sysvar = "SysvarRent111111111111111111111111111111111"
+        sys_program = "11111111111111111111111111111111"
+        token_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        token2022_program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+        ata_program = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        pos_nft_ata = self._derive_ata(self.owner_pubkey, mint_pub, token_program_id=token2022_program)
+        name_map: Dict[str, str] = {
+            "payer": self.owner_pubkey,
+            "position_nft_owner": self.owner_pubkey,
+            "nft_owner": self.owner_pubkey,
+            "position_nft_mint": mint_pub,
+            "nft_mint": mint_pub,
+            "position_nft_account": pos_nft_ata or "",
+            "nft_account": pos_nft_ata or "",
+            "pool": pool_id,
+            "pool_state": pool_id,
+            "protocol_position": proto_pos,
+            "tick_array_lower": ta_lo,
+            "tickarraylower": ta_lo,
+            "tick_array_upper": ta_hi,
+            "tickarrayupper": ta_hi,
+            "personal_position": personal_pos,
+            "token_account_0": ata_a or "",
+            "token_account_a": ata_a or "",
+            "token_account_1": ata_b or "",
+            "token_account_b": ata_b or "",
+            "token_vault_0": vault0,
+            "token_vault_a": vault0,
+            "token_vault_1": vault1,
+            "token_vault_b": vault1,
+            "token_mint_0": (mint0 or ""),
+            "token_mint_a": (mint0 or ""),
+            "vault_0_mint": (mint0 or ""),
+            "token_mint_1": (mint1 or ""),
+            "token_mint_b": (mint1 or ""),
+            "vault_1_mint": (mint1 or ""),
+            "rent": rent_sysvar,
+            "system_program": sys_program,
+            "token_program": token_program,
+            "token_program_2022": token2022_program,
+            "associated_token_program": ata_program,
+        }
+        def resolve_account_name(n: str) -> Optional[str]:
+            k = (n or "").replace(" ", "").replace("-", "_").lower()
+            return name_map.get(k)
+        keys: List[Dict[str, Any]] = []
+        for a in acc_list:
+            try:
+                nm = str(a.get("name"))
+                pk = resolve_account_name(nm)
+                if not pk:
+                    # fallback por alias comunes
+                    if "tick" in nm.lower() and "lower" in nm.lower():
+                        pk = ta_lo
+                    elif "tick" in nm.lower() and "upper" in nm.lower():
+                        pk = ta_hi
+                    elif "vault" in nm.lower() and ("0" in nm or "a" in nm.lower()):
+                        pk = vault0
+                    elif "vault" in nm.lower() and ("1" in nm or "b" in nm.lower()):
+                        pk = vault1
+                if not pk:
+                    pk = sys_program
+                # Determinar flags signer/writable con overrides según nombre
+                is_signer_flag = bool(a.get("isSigner"))
+                is_writable_flag = bool(a.get("isMut"))
+                nml = (nm or "").lower()
+                if ("mint" in nml and ("nft" in nml or "position" in nml)):
+                    is_signer_flag = True
+                    is_writable_flag = True
+                # Cuentas que el programa modifica en CPI deben ser writable
+                if (
+                    "personal_position" in nml
+                    or "personalposition" in nml
+                    or "protocol_position" in nml
+                    or "protocolposition" in nml
+                    or nml in ("pool", "pool_state")
+                    or nml.startswith("tick_array")
+                    or nml.startswith("tickarray")
+                    or nml.startswith("token_vault")
+                    or nml.startswith("tokenaccount")
+                    or nml.startswith("token_account")
+                    or "position_nft_account" in nml
+                    or "nft_account" in nml
+                ):
+                    is_writable_flag = True
+                keys.append({
+                    "pubkey": pk,
+                    "is_signer": is_signer_flag,
+                    "is_writable": is_writable_flag,
+                })
+            except Exception:
+                continue
+
+        return {
+            "program_id": self.config.program_id_clmm,
+            "keys": keys,
+            "data": data,
+            "accounts": {
+                "pool": pool_id,
+                "tickArrays": {"lower": ta_lo, "upper": ta_hi, "start": {"lower": start_lo, "upper": start_hi}},
+                "personalPosition": personal_pos,
+                "protocolPosition": proto_pos,
+                "vaults": {"A": vault0, "B": vault1},
+                "positionNft": {"mint": mint_pub, "owner": self.owner_pubkey, "ata": self._derive_ata(self.owner_pubkey, mint_pub)},
+                "tokenAccounts": {"A": ata_a, "B": ata_b},
+            },
+            "signers": {
+                "positionNftMint": __import__("base64").b64encode(bytes(mint_kp)).decode("utf-8"),
+            },
+            "notes": notes,
+        }
+
+    def liquidity_prepare_anchor_open(
+        self,
+        mintA: str,
+        mintB: str,
+        pool_id: str,
+        tick_lower: int,
+        tick_upper: int,
+        amountA_desired: int,
+        amountB_desired: int,
+        slippage_bps: int = 50,
+        compute_unit_price_micro: int = 25_000,
+        compute_unit_limit: int = 600_000,
+    ) -> Dict[str, Any]:
+        """Prepara instrucción Anchor para abrir posición CLMM con Token-2022 NFT.
+        Devuelve estructura con ix Anchor y parámetros de Compute Budget. No compila ni firma la tx.
+        """
+        # mínimos/máximos por slippage (cliente) + pequeño headroom de ejecución
+        slip = max(0, int(slippage_bps))
+        a_min = (int(amountA_desired) * (10000 - slip)) // 10000
+        b_min = (int(amountB_desired) * (10000 - slip)) // 10000
+        # Añadimos 100 bps de colchón adicional para cubrir redondeos/cambios intra-bloque
+        exec_buf_bps = 100
+        headroom_bps = min(20000, slip + exec_buf_bps)
+        a_max = (int(amountA_desired) * (10000 + headroom_bps)) // 10000
+        b_max = (int(amountB_desired) * (10000 + headroom_bps)) // 10000
+        notes: List[str] = []
+        try:
+            # Si hay SOL, crear cuentas WSOL temporales (ATAs) como token accounts explícitos
+            token_account_a = None
+            token_account_b = None
+            prewrap: List[Dict[str, Any]] = []
+            postunwrap: List[Dict[str, Any]] = []
+            createATAs: List[Dict[str, Any]] = []
+            if self._is_sol_mint(mintA):
+                token_account_a = self._derive_ata(self.owner_pubkey, self.SOL_MINT)
+                prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": token_account_a, "lamports": int(a_max)})
+                postunwrap.append({"kind": "unwrap", "ata": token_account_a})
+                try:
+                    exists_a = self._ata_exists(token_account_a)
+                except Exception:
+                    exists_a = None
+                if exists_a is False:
+                    createATAs.append({"owner": self.owner_pubkey, "mint": self.SOL_MINT})
+            if self._is_sol_mint(mintB):
+                token_account_b = self._derive_ata(self.owner_pubkey, self.SOL_MINT)
+                prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": token_account_b, "lamports": int(b_max)})
+                postunwrap.append({"kind": "unwrap", "ata": token_account_b})
+                try:
+                    exists_b = self._ata_exists(token_account_b)
+                except Exception:
+                    exists_b = None
+                if exists_b is False:
+                    createATAs.append({"owner": self.owner_pubkey, "mint": self.SOL_MINT})
+            # Crear ATAs si faltan (tokens no SOL)
+            if not self._is_sol_mint(mintA):
+                try:
+                    ata_a_check = self._derive_ata(self.owner_pubkey, mintA)
+                    exists_a = self._ata_exists(ata_a_check)
+                    if exists_a is False:
+                        createATAs.append({"owner": self.owner_pubkey, "mint": mintA})
+                except Exception:
+                    pass
+            if not self._is_sol_mint(mintB):
+                try:
+                    ata_b_check = self._derive_ata(self.owner_pubkey, mintB)
+                    exists_b = self._ata_exists(ata_b_check)
+                    if exists_b is False:
+                        createATAs.append({"owner": self.owner_pubkey, "mint": mintB})
+                except Exception:
+                    pass
+            # Aporte dual por defecto; mantenemos prewrap si hay SOL en A o B
+            adj_amount0 = int(a_max)
+            adj_amount1 = int(b_max)
+            base_flag_val: Optional[bool] = False
+            ix = self.build_open_position_with_token22_ix(
+                pool_id=pool_id,
+                mintA=mintA,
+                mintB=mintB,
+                tick_lower=int(tick_lower),
+                tick_upper=int(tick_upper),
+                amount0_max=adj_amount0,
+                amount1_max=adj_amount1,
+                with_metadata=True,
+                base_flag=base_flag_val,
+                token_account_a=token_account_a,
+                token_account_b=token_account_b,
+            )
+        except Exception as exc:
+            return {"canSend": False, "error": str(exc), "notes": [str(exc)]}
+        cb = {"microLamports": int(compute_unit_price_micro), "units": int(compute_unit_limit)}
+        # Advertencias si faltan ATAs o si hay SOL nativo
+        accs = (ix or {}).get("accounts") or {}
+        tacc = (accs.get("tokenAccounts") or {})
+        if (tacc.get("A") is None) and (mintA != self.SOL_MINT):
+            notes.append("Falta ATA de token A para el owner")
+        if (tacc.get("B") is None) and (mintB != self.SOL_MINT):
+            notes.append("Falta ATA de token B para el owner")
+        if mintA == self.SOL_MINT or mintB == self.SOL_MINT:
+            notes.append("Requiere WSOL pre-wrap en ATA del owner")
+        meta = {
+            "poolId": pool_id,
+            "ticks": {"lower": int(tick_lower), "upper": int(tick_upper)},
+            "amounts": {"A": int(amountA_desired), "B": int(amountB_desired), "minA": int(a_min), "minB": int(b_min)},
+            "computeBudget": cb,
+        }
+        return {"anchor": {"ix": ix, "computeBudget": cb, "prewrap": prewrap, "postunwrap": postunwrap, "createATAs": createATAs}, "meta": meta, "canSend": False, "notes": notes}
+
+    def build_increase_liquidity_ix(
+        self,
+        pool_id: str,
+        position_nft_mint: str,
+        mintA: str,
+        mintB: str,
+        tick_lower: int,
+        tick_upper: int,
+        amount0_max: int,
+        amount1_max: int,
+        tick_spacing_hint: Optional[int] = None,
+        base_flag: Optional[bool] = True,
+    ) -> Dict[str, Any]:
+        """Construye instrucción Anchor para añadir liquidez a una posición existente.
+        Requiere NFT mint de la posición para derivar el PDA personal.
+        """
+        pool_state = self.get_pool_state_decoded(pool_id)
+        spacing = None
+        for k in ("tick_spacing", "tickSpacing", "tick_spacing_index"):
+            if pool_state.get(k) is not None:
+                try:
+                    spacing = int(pool_state.get(k)); break
+                except Exception:
+                    pass
+        if spacing is None and tick_spacing_hint is not None:
+            spacing = int(tick_spacing_hint)
+        if spacing is None:
+            raise RuntimeError("No se pudo determinar tickSpacing de la pool")
+        vault0, vault1 = self.get_pool_vaults(pool_state)
+        if not vault0 or not vault1:
+            raise RuntimeError("No se pudieron determinar los vaults de la pool")
+
+        start_lo = self.compute_tick_array_start_index(tick_lower, spacing)
+        start_hi = self.compute_tick_array_start_index(tick_upper, spacing)
+        ta_lo, _ = self.derive_tick_array_pda(pool_id, start_lo)
+        ta_hi, _ = self.derive_tick_array_pda(pool_id, start_hi)
+        personal_pos, _b = self._derive_personal_position_pda(position_nft_mint)
+        proto_pos, _pb = self.derive_protocol_position_pda(pool_id, tick_lower, tick_upper)
+
+        ata_a = self._derive_ata(self.owner_pubkey, mintA) if not self._is_sol_mint(mintA) else None
+        ata_b = self._derive_ata(self.owner_pubkey, mintB) if not self._is_sol_mint(mintB) else None
+        notes: List[str] = []
+        if self._is_sol_mint(mintA):
+            notes.append("mintA es SOL: pre-wrap WSOL en ATA")
+        if self._is_sol_mint(mintB):
+            notes.append("mintB es SOL: pre-wrap WSOL en ATA")
+
+        ix_name = "increase_liquidity"
+        data = b"".join([
+            self._anchor_discriminator(ix_name),
+            self._encode_i32_le(int(tick_lower)),
+            self._encode_i32_le(int(tick_upper)),
+            self._encode_i32_le(int(start_lo)),
+            self._encode_i32_le(int(start_hi)),
+            self._encode_u128_le(0),
+            self._encode_u64_le(int(amount0_max)),
+            self._encode_u64_le(int(amount1_max)),
+            self._encode_option_bool(base_flag),
+        ])
+
+        keys: List[Dict[str, Any]] = [
+            {"pubkey": self.owner_pubkey, "is_signer": True, "is_writable": True},
+            {"pubkey": pool_id, "is_signer": False, "is_writable": True},
+            {"pubkey": proto_pos, "is_signer": False, "is_writable": True},
+            {"pubkey": ta_lo, "is_signer": False, "is_writable": True},
+            {"pubkey": ta_hi, "is_signer": False, "is_writable": True},
+            {"pubkey": personal_pos, "is_signer": False, "is_writable": True},
+            {"pubkey": (ata_a or ""), "is_signer": False, "is_writable": True},
+            {"pubkey": (ata_b or ""), "is_signer": False, "is_writable": True},
+            {"pubkey": vault0, "is_signer": False, "is_writable": True},
+            {"pubkey": vault1, "is_signer": False, "is_writable": True},
+            {"pubkey": "11111111111111111111111111111111", "is_signer": False, "is_writable": False},
+        ]
+        for pid in (
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+        ):
+            keys.append({"pubkey": pid, "is_signer": False, "is_writable": False})
+
+        return {
+            "program_id": self.config.program_id_clmm,
+            "keys": keys,
+            "data": data,
+            "accounts": {
+                "pool": pool_id,
+                "tickArrays": {"lower": ta_lo, "upper": ta_hi, "start": {"lower": start_lo, "upper": start_hi}},
+                "personalPosition": personal_pos,
+                "protocolPosition": proto_pos,
+                "vaults": {"A": vault0, "B": vault1},
+                "tokenAccounts": {"A": ata_a, "B": ata_b},
+                "positionNftMint": position_nft_mint,
+            },
+            "notes": notes,
+        }
+
+    def liquidity_prepare_anchor_increase(
+        self,
+        pool_id: str,
+        position_nft_mint: str,
+        mintA: str,
+        mintB: str,
+        tick_lower: int,
+        tick_upper: int,
+        amountA_desired: int,
+        amountB_desired: int,
+        slippage_bps: int = 50,
+        compute_unit_price_micro: int = 25_000,
+        compute_unit_limit: int = 600_000,
+    ) -> Dict[str, Any]:
+        slip = max(0, int(slippage_bps))
+        a_min = (int(amountA_desired) * (10000 - slip)) // 10000
+        b_min = (int(amountB_desired) * (10000 - slip)) // 10000
+        try:
+            ix = self.build_increase_liquidity_ix(
+                pool_id=pool_id,
+                position_nft_mint=position_nft_mint,
+                mintA=mintA,
+                mintB=mintB,
+                tick_lower=int(tick_lower),
+                tick_upper=int(tick_upper),
+                amount0_max=int(amountA_desired),
+                amount1_max=int(amountB_desired),
+            )
+        except Exception as exc:
+            return {"canSend": False, "error": str(exc), "notes": [str(exc)]}
+        cb = {"microLamports": int(compute_unit_price_micro), "units": int(compute_unit_limit)}
+        meta = {
+            "poolId": pool_id,
+            "position": position_nft_mint,
+            "ticks": {"lower": int(tick_lower), "upper": int(tick_upper)},
+            "amounts": {"A": int(amountA_desired), "B": int(amountB_desired), "minA": int(a_min), "minB": int(b_min)},
+            "computeBudget": cb,
+        }
+        return {"anchor": {"ix": ix, "computeBudget": cb}, "meta": meta, "canSend": False, "notes": ix.get("notes") or []}
+
     def _get_account_info_base64(self, pubkey: str) -> Optional[str]:
         try:
             data = self._rpc_call_with_failover("getAccountInfo", [pubkey, {"encoding": "base64"}])
@@ -456,26 +2429,13 @@ class RaydiumAdapter:
             pos_details = self._decode_account(acc_name, pda, pos_b64)
             if not isinstance(pos_details, dict):
                 return {"exists": False, "details": {}}
-            # 2) Leer pool y extraer tick actual
+            # 2) Leer pool y extraer tick actual (reutilizando helper)
             pool_id = pos_details.get("pool_id")
             current_tick: Optional[int] = None
             if isinstance(pool_id, str) and pool_id:
-                pool_b64 = self._get_account_info_base64(pool_id)
-                if pool_b64:
-                    pool_details = self._decode_account("PoolState", pool_id, pool_b64)
-                    # Intentar diferentes nombres comunes
-                    for key in ("tick_current_index", "tickCurrentIndex", "tick_current", "current_tick_index"):
-                        if isinstance(pool_details, dict) and key in pool_details:
-                            try:
-                                current_tick = int(pool_details[key])
-                                self.logger.info("Pool encontrada: ID=%s, tickCurrent=%s", pool_id, current_tick)
-                                break
-                            except Exception:
-                                pass
-                    if current_tick is None:
-                        self.logger.warning("No se pudo extraer tickCurrent de la pool %s", pool_id)
-                else:
-                    self.logger.warning("Cuenta de pool no encontrada: %s", pool_id)
+                current_tick = self.get_pool_tick_current(pool_id)
+                if current_tick is None:
+                    self.logger.warning("No se pudo extraer tickCurrent de la pool %s", pool_id)
             else:
                 self.logger.warning("pool_id inválido en posición: %s", pool_id)
             # 3) Unir y devolver
@@ -486,6 +2446,31 @@ class RaydiumAdapter:
         except Exception as exc:
             self.logger.error("Error verificando posición %s: %s", position_nft_mint, exc)
             return {"exists": False, "details": {"error": f"position check failed: {exc}"}}
+
+    def get_pool_tick_current(self, pool_id: str) -> Optional[int]:
+        """Lee la cuenta on-chain de la pool CLMM y extrae el tick actual.
+        Devuelve int o None si no se puede determinar.
+        """
+        if not pool_id:
+            raise ValueError("pool_id es obligatorio")
+        pool_b64 = self._get_account_info_base64(pool_id)
+        if not pool_b64:
+            self.logger.warning("Cuenta de pool no encontrada: %s", pool_id)
+            return None
+        details = self._decode_account("PoolState", pool_id, pool_b64)
+        current_tick: Optional[int] = None
+        for key in ("tick_current_index", "tickCurrentIndex", "tick_current", "current_tick_index"):
+            if isinstance(details, dict) and key in details:
+                try:
+                    current_tick = int(details[key])
+                    break
+                except Exception:
+                    continue
+        if current_tick is None:
+            self.logger.warning("tickCurrent no disponible en cuenta de pool %s", pool_id)
+        else:
+            self.logger.info("tickCurrent(pool %s)=%s", pool_id, current_tick)
+        return current_tick
 
 
 __all__ = ["RaydiumAdapter", "RaydiumConfig"]

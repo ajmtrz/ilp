@@ -118,3 +118,37 @@ class ClmmDecoder:
                 os.unlink(tmp_idl_path)
             except Exception:
                 pass
+
+    # ---------------------- IDL inspection helpers ----------------------
+    def list_instructions(self) -> List[Dict[str, Any]]:
+        """Devuelve un resumen de instrucciones del IDL: nombre y cuentas requeridas.
+        Formato: [{name, accounts:[{name, isMut, isSigner, pda?}] }]
+        """
+        out: List[Dict[str, Any]] = []
+        for ix in (self.idl.get("instructions") or []):
+            try:
+                name = ix.get("name")
+                accs_in = ix.get("accounts") or []
+                accs_out: List[Dict[str, Any]] = []
+                for a in accs_in:
+                    acc_item = {
+                        "name": a.get("name"),
+                        "isMut": bool(a.get("isMut")),
+                        "isSigner": bool(a.get("isSigner")),
+                    }
+                    # PDAs (si están definidas en el IDL)
+                    pda = a.get("pda") or {}
+                    if pda:
+                        acc_item["pda"] = pda
+                    accs_out.append(acc_item)
+                out.append({"name": name, "accounts": accs_out})
+            except Exception:
+                continue
+        return out
+
+    def get_instruction_schema(self, name: str) -> Dict[str, Any]:
+        """Devuelve el objeto de instrucción del IDL (incluye cuentas y args)."""
+        for ix in (self.idl.get("instructions") or []):
+            if ix.get("name") == name:
+                return ix
+        raise ValueError(f"Instrucción no encontrada en IDL: {name}")
