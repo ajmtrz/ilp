@@ -764,6 +764,23 @@ class RaydiumAdapter:
             raise RuntimeError("No se pudo obtener latest blockhash")
         return bh
 
+    def _get_token_account_balance_int(self, token_account: str) -> Optional[int]:
+        """Devuelve el balance (amount entero, sin decimales) de una cuenta SPL usando getTokenAccountBalance.
+        Retorna None si no está disponible.
+        """
+        try:
+            resp = self._rpc_call_with_failover("getTokenAccountBalance", [token_account, {"commitment": "processed"}])
+            val = (resp.get("result") or {}).get("value") or {}
+            amt = val.get("amount")
+            if isinstance(amt, str) and amt.isdigit():
+                return int(amt)
+            try:
+                return int(str(amt))
+            except Exception:
+                return None
+        except Exception:
+            return None
+
     def _assemble_v0_from_anchor(self, anchor_obj: Dict[str, Any]) -> Tuple[str, List[str]]:
         """Empaqueta ComputeBudget + ix Anchor en una transacción V0 y la devuelve en base64.
         Retorna (tx_b64, extra_signers_b64[]).
@@ -788,6 +805,8 @@ class RaydiumAdapter:
         prewrap = (anc.get("anchor") or {}).get("prewrap") or []
         postunwrap = (anc.get("anchor") or {}).get("postunwrap") or []
         create_atas = (anc.get("anchor") or {}).get("createATAs") or []
+        create_with_seed = (anc.get("anchor") or {}).get("createWithSeed") or []
+        extra_anchor_ixs = (anc.get("anchor") or {}).get("extraIxs") or []  # lista de ixs extra tipo Anchor
         # Autorrellenar prewrap si falta pero hay SOL en el par (basado en token_accounts y/o decodificando ix.data)
         try:
             if not prewrap:
@@ -1118,7 +1137,7 @@ class RaydiumAdapter:
         # Ensamblar mensaje V0
         recent_blockhash = self._get_latest_blockhash()
         payer_pk = Pubkey.from_string(self.owner_pubkey)
-        # Build create ATA + wrap/unwrap ixs usando ATA, Token y System Program
+        # Build create ATA + createWithSeed + wrap/unwrap ixs usando ATA, Token y System Program
         sys_program = Pubkey.from_string("11111111111111111111111111111111")
         token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
         wsol_mint = Pubkey.from_string(self.SOL_MINT)
@@ -1162,6 +1181,162 @@ class RaydiumAdapter:
                             pass
             except Exception:
                 continue
+        # 0.b) CreateAccountWithSeed + InitializeAccount (para cuenta WSOL temporal)
+        for cws in (create_with_seed or []):
+            try:
+                base_str = str(cws.get("base"))
+                seed_str = str(cws.get("seed"))
+                new_acc_str = str(cws.get("newAccount"))
+                lamports = int(cws.get("lamports", 0))
+                # Intento 1: helper solders
+                ix_seed = None
+                try:
+                    from solders.system_program import create_account_with_seed, CreateAccountWithSeedParams  # type: ignore
+                    base_pk = Pubkey.from_string(base_str)
+                    new_pk = Pubkey.from_string(new_acc_str)
+                    ix_seed = create_account_with_seed(CreateAccountWithSeedParams(
+                        from_pubkey=payer_pk,
+                        new_account_pubkey=new_pk,
+                        base=base_pk,
+                        seed=seed_str,
+                        lamports=lamports,
+                        space=165,
+                        owner=token_program,
+                    ))
+                    wrap_ixs.append(ix_seed)
+                except Exception:
+                    # Intento 2: construir manualmente la ix (SystemProgram::CreateAccountWithSeed)
+                    try:
+                        sys_program = Pubkey.from_string("11111111111111111111111111111111")
+                        base_pk = Pubkey.from_string(base_str)
+                        new_pk = Pubkey.from_string(new_acc_str)
+                        import struct as _st
+                        # borsh: u32 instr(3), base(32), seed(str: u32 len + bytes), lamports(u64), space(u64), owner(32)
+                        data_buf = bytearray()
+                        data_buf += (3).to_bytes(4, "little", signed=False)
+                        data_buf += bytes(base_pk)
+                        seed_bytes = seed_str.encode("utf-8")
+                        # bincode for SystemInstruction uses u64 for string len
+                        data_buf += len(seed_bytes).to_bytes(8, "little", signed=False)
+                        data_buf += seed_bytes
+                        data_buf += int(lamports).to_bytes(8, "little", signed=False)
+                        data_buf += int(165).to_bytes(8, "little", signed=False)
+                        data_buf += bytes(token_program)
+                        metas_seed = [
+                            AccountMeta(payer_pk, True, True),
+                            AccountMeta(new_pk, False, True),
+                            AccountMeta(base_pk, False, False),
+                        ]
+                        ix_seed = SInstruction(sys_program, bytes(data_buf), tuple(metas_seed))
+                        wrap_ixs.append(ix_seed)
+                    except Exception:
+                        ix_seed = None
+                # initializeAccount (Token Program v2): tag=1, cuentas: [account(w), mint(r), owner(r), rent]
+                rent_pk = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+                metas_init = [
+                    AccountMeta(new_pk, False, True),
+                    AccountMeta(wsol_mint, False, False),
+                    AccountMeta(payer_pk, False, False),
+                    AccountMeta(rent_pk, False, False),
+                ]
+                init_ix = SInstruction(token_program, bytes([1]), tuple(metas_init))
+                wrap_ixs.append(init_ix)
+            except Exception:
+                continue
+        # 0.b-extra) Salvaguarda: si el ix anchor usa una cuenta WSOL temporal derivable y aún no hemos añadido create+init, crearla aquí
+        try:
+            # Detectar si el ix corresponde a decrease_liquidity_v2 y extraer recipient_token_account_0
+            keys_for_ix = list(keys_desc) if isinstance(keys_desc, list) else []
+            looks_like_dec = (
+                isinstance(prog_id, str)
+                and str(prog_id) == str(self.config.program_id_clmm)
+                and len(keys_for_ix) >= 15
+            )
+            if looks_like_dec:
+                recv0_key = None
+                try:
+                    recv0_key = keys_for_ix[9].get("pubkey") if isinstance(keys_for_ix[9], dict) else None
+                except Exception:
+                    recv0_key = None
+                # Extraer position nft mint del objeto de cuentas si está disponible
+                accs_map = (ix_desc.get("accounts") or {}) if isinstance(ix_desc, dict) else {}
+                pos_mint = accs_map.get("positionNftMint")
+                # expected ATA WSOL del owner
+                expected_wsol_ata = self._derive_ata(self.owner_pubkey, self.SOL_MINT)
+                # Función para comprobar si ya añadimos create/init para recv0_key
+                def _has_seed_setup_for(target_pk: str) -> bool:
+                    has_create = False
+                    has_init = False
+                    for ix in wrap_ixs:
+                        try:
+                            pid = getattr(ix, "program_id", None)
+                            if pid is None:
+                                continue
+                            if str(pid) == str(sys_program):
+                                # create_with_seed incluye la cuenta nueva como writable
+                                for am in list(getattr(ix, "accounts", []) or []):
+                                    try:
+                                        if str(getattr(am, "pubkey", "")) == target_pk and bool(getattr(am, "is_writable", False)):
+                                            has_create = True
+                                            break
+                                    except Exception:
+                                        continue
+                            if str(pid) == str(token_program):
+                                data = getattr(ix, "data", b"")
+                                tag = None
+                                try:
+                                    tag = int(data[0]) if isinstance(data, (bytes, bytearray)) and len(data) > 0 else None
+                                except Exception:
+                                    tag = None
+                                if tag == 1:
+                                    # initializeAccount: primera cuenta debe ser la nueva
+                                    accts = list(getattr(ix, "accounts", []) or [])
+                                    if accts and str(getattr(accts[0], "pubkey", "")) == target_pk:
+                                        has_init = True
+                        except Exception:
+                            continue
+                    return has_create and has_init
+                if (
+                    isinstance(recv0_key, str)
+                    and recv0_key
+                    and recv0_key != expected_wsol_ata
+                    and isinstance(pos_mint, str)
+                    and len(pos_mint) > 0
+                    and not _has_seed_setup_for(recv0_key)
+                ):
+                    # Recrear la misma dirección con seed determinista y verificar coincidencia
+                    import hashlib as _hl
+                    seed_str = _hl.sha256((pos_mint + ":wsol").encode("utf-8")).hexdigest()[:32]
+                    try:
+                        derived = Pubkey.create_with_seed(payer_pk, seed_str, token_program)
+                        if str(derived) == recv0_key:
+                            from solders.system_program import create_account_with_seed, CreateAccountWithSeedParams  # type: ignore
+                            lamports = 2_039_280
+                            ix_seed = create_account_with_seed(CreateAccountWithSeedParams(
+                                from_pubkey=payer_pk,
+                                new_account_pubkey=derived,
+                                base=payer_pk,
+                                seed=seed_str,
+                                lamports=lamports,
+                                space=165,
+                                owner=token_program,
+                            ))
+                            wrap_ixs.append(ix_seed)
+                            rent_pk = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+                            metas_init = [
+                                AccountMeta(derived, False, True),
+                                AccountMeta(wsol_mint, False, False),
+                                AccountMeta(payer_pk, False, False),
+                                AccountMeta(rent_pk, False, False),
+                            ]
+                            init_ix = SInstruction(token_program, bytes([1]), tuple(metas_init))
+                            wrap_ixs.append(init_ix)
+                            if not postunwrap:
+                                postunwrap.append({"kind": "unwrap", "ata": recv0_key})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # 1) Wraps (transfer + syncNative). La creación de ATA ya se programa en create_atas.
         for w in prewrap:
             try:
@@ -1355,7 +1530,51 @@ class RaydiumAdapter:
             except Exception as exc:
                 raise RuntimeError(f"No se pudo convertir ix a solders: {exc}")
 
-        all_ixs_raw = ([] if ix_cu_price is None else [ix_cu_price]) + ([] if ix_cu_limit is None else [ix_cu_limit]) + wrap_ixs + [anchor_ix] + unwrap_ixs
+        # Convertir extra_anchor_ixs (si vienen como descriptores anchor {program_id, keys, data}) a SInstruction
+        extra_solders: List[Any] = []
+        for eix in (extra_anchor_ixs or []):
+            try:
+                if isinstance(eix, dict) and eix.get("program_id") and eix.get("keys") is not None:
+                    prog_pk = Pubkey.from_string(str(eix.get("program_id")))
+                    ekeys = []
+                    for k in (eix.get("keys") or []):
+                        if not isinstance(k, dict) or not k.get("pubkey"):
+                            continue
+                        ekeys.append(AccountMeta(Pubkey.from_string(str(k.get("pubkey"))), bool(k.get("is_signer")), bool(k.get("is_writable"))))
+                    edata = eix.get("data")
+                    if isinstance(edata, (bytes, bytearray)):
+                        edb = bytes(edata)
+                    elif isinstance(edata, list):
+                        buf = bytearray()
+                        for x in edata:
+                            if isinstance(x, int):
+                                buf.append(x & 0xFF)
+                            elif isinstance(x, (bytes, bytearray)):
+                                buf.extend(x)
+                            elif isinstance(x, str):
+                                s = x.strip()
+                                if s.startswith("0x"):
+                                    buf.extend(bytes.fromhex(s[2:]))
+                                else:
+                                    buf.extend(s.encode("utf-8"))
+                            else:
+                                buf.extend(bytes(str(x), "utf-8"))
+                        edb = bytes(buf)
+                    elif isinstance(edata, str):
+                        s = edata.strip()
+                        if s.startswith("0x"):
+                            try:
+                                edb = bytes.fromhex(s[2:])
+                            except Exception:
+                                edb = s.encode("utf-8")
+                        else:
+                            edb = s.encode("utf-8")
+                    else:
+                        edb = b""
+                    extra_solders.append(SInstruction(prog_pk, edb, tuple(ekeys)))
+            except Exception:
+                continue
+        all_ixs_raw = ([] if ix_cu_price is None else [ix_cu_price]) + ([] if ix_cu_limit is None else [ix_cu_limit]) + wrap_ixs + [anchor_ix] + unwrap_ixs + extra_solders
         # Detección temprana: identificar cualquier ix cuya data sea list
         try:
             for i, ix in enumerate(all_ixs_raw):
@@ -1505,19 +1724,17 @@ class RaydiumAdapter:
         client = self._rpc_client()
         signatures: List[str] = []
         receipts: List[Dict[str, Any]] = []
+
         def _extract_sig(resp_obj: Any) -> Optional[str]:
             if isinstance(resp_obj, dict):
                 return resp_obj.get("result") or resp_obj.get("value") or resp_obj.get("signature")
-            # RPCResponse-like
             val = getattr(resp_obj, "value", None)
             if isinstance(val, str):
                 return val
-            # Fallback to string
             try:
                 s = str(resp_obj)
                 if not s:
                     return None
-                # Intenta extraer base58 de "Signature(<base58>)"
                 import re
                 m = re.search(r"Signature\(([1-9A-HJ-NP-Za-km-z]{32,})\)", s)
                 if m:
@@ -1525,6 +1742,7 @@ class RaydiumAdapter:
                 return s
             except Exception:
                 return None
+
         def _to_jsonable(obj: Any) -> Any:
             if isinstance(obj, (str, int, float, bool)) or obj is None:
                 return obj
@@ -1545,11 +1763,10 @@ class RaydiumAdapter:
                 return str(obj)
             except Exception:
                 return None
+
         extra_signers: List[Any] = []
         try:
-            # 1) Preferir extraSigners planos en prep
             flat_extras = prep.get("extraSigners") or []
-            # 2) Respaldo: si vienen dentro de prep.anchor.signers (dict name->b64)
             if not flat_extras:
                 anchor_sign_map = ((prep.get("anchor") or {}).get("signers") or {})
                 if isinstance(anchor_sign_map, dict):
@@ -1562,66 +1779,60 @@ class RaydiumAdapter:
                     continue
         except Exception:
             pass
+
         for tx_b64 in prep.get("transactions", []):
             raw = __import__("base64").b64decode(tx_b64)
-            sig = None
+            sig: Optional[str] = None
+            # 1) Intentar decodificar como VersionedTransaction
             try:
-                # Intentar interpretar como VersionedTransaction completa
+                vtx = VersionedTransaction.from_bytes(raw)
+            except Exception:
                 vtx = None
+            # 2) Si no es una tx completa, construirla desde MessageV0
+            if vtx is None:
                 try:
-                    vtx = VersionedTransaction.from_bytes(raw)
-                except Exception:
-                    vtx = None
-                # Si no es una tx, interpretar como MessageV0 y construir tx firmable
-                if vtx is None:
+                    from solders.message import MessageV0  # type: ignore
+                    msg = MessageV0.from_bytes(raw)
+                    # Construir lista de firmantes requerida en orden
+                    ordered_signers: List[Any] = []
                     try:
-                        from solders.message import MessageV0  # type: ignore
-                        msg = MessageV0.from_bytes(raw)
-                        # Construir lista de firmantes exacta y ordenada según el mensaje
-                        ordered_signers = []
-                        try:
-                            hdr = getattr(msg, "header", None)
-                            num_req = int(getattr(hdr, "num_required_signatures", 0)) if hdr is not None else 0
-                            # Mapa pubkey->Keypair disponible
-                            signer_map = {str(kp.pubkey()): kp}
-                            for ex in (extra_signers or []):
-                                try:
-                                    signer_map[str(ex.pubkey())] = ex
-                                except Exception:
-                                    continue
-                            # Obtener claves estáticas (ordenadas) y tomar las primeras num_req
-                            static_keys = []
+                        hdr = getattr(msg, "header", None)
+                        num_req = int(getattr(hdr, "num_required_signatures", 0)) if hdr is not None else 0
+                        signer_map = {str(kp.pubkey()): kp}
+                        for ex in (extra_signers or []):
                             try:
-                                static_keys = [str(pk) for pk in list(getattr(msg, "static_account_keys", []) or [])]
+                                signer_map[str(ex.pubkey())] = ex
                             except Exception:
-                                static_keys = []
-                            if not static_keys:
-                                # Fallback: usar payer y luego extras hasta num_req
-                                ordered_signers = [kp] + list((extra_signers or []))
-                                if num_req > 0:
-                                    ordered_signers = ordered_signers[:num_req]
-                            else:
-                                required_keys = static_keys[:num_req] if num_req > 0 else []
-                                for sk in required_keys:
-                                    s = signer_map.get(sk)
-                                    if s is None:
-                                        # Si falta, usar payer como último recurso para la primera posición
-                                        if sk == str(kp.pubkey()):
-                                            s = kp
-                                    if s is not None:
-                                        ordered_signers.append(s)
-                                # Asegurar longitud exacta
-                                if num_req > 0 and len(ordered_signers) > num_req:
-                                    ordered_signers = ordered_signers[:num_req]
-                                if num_req > 0 and len(ordered_signers) < num_req and self.logger.isEnabledFor(logging.ERROR):
-                                    self.logger.error("firmado insuficiente tras ordenar: required=%d provided=%d", num_req, len(ordered_signers))
+                                continue
+                        try:
+                            static_keys = [str(pk) for pk in list(getattr(msg, "static_account_keys", []) or [])]
                         except Exception:
-                            # Fallback simple
+                            static_keys = []
+                        if not static_keys:
                             ordered_signers = [kp] + list((extra_signers or []))
-                        vtx = VersionedTransaction(msg, ordered_signers)
-                    except Exception as exc_build:
-                        raise RuntimeError(f"No se pudo construir VersionedTransaction desde message: {exc_build}")
-                # Enviar
+                            if num_req > 0:
+                                ordered_signers = ordered_signers[:num_req]
+                        else:
+                            required_keys = static_keys[:num_req] if num_req > 0 else []
+                            for sk in required_keys:
+                                s_obj = signer_map.get(sk)
+                                if s_obj is None and sk == str(kp.pubkey()):
+                                    s_obj = kp
+                                if s_obj is not None:
+                                    ordered_signers.append(s_obj)
+                            if num_req > 0 and len(ordered_signers) > num_req:
+                                ordered_signers = ordered_signers[:num_req]
+                            if num_req > 0 and len(ordered_signers) < num_req and self.logger.isEnabledFor(logging.ERROR):
+                                self.logger.error("firmado insuficiente tras ordenar: required=%d provided=%d", num_req, len(ordered_signers))
+                    except Exception:
+                        ordered_signers = [kp] + list((extra_signers or []))
+                    vtx = VersionedTransaction(msg, ordered_signers)
+                except Exception as exc_build:
+                    self.logger.error("Error construyendo VersionedTransaction: %s", exc_build)
+                    receipts.append({"error": str(exc_build)})
+                    continue
+            # 3) Enviar
+            try:
                 opts = TxOpts(skip_preflight=True, preflight_commitment="confirmed")
                 resp = client.send_raw_transaction(bytes(vtx), opts=opts)
                 sig = _extract_sig(resp)
@@ -1629,6 +1840,7 @@ class RaydiumAdapter:
                 self.logger.error("Error enviando transacción v0: %s", exc)
                 receipts.append({"error": str(exc)})
                 continue
+
             signatures.append(sig)
             if wait and sig:
                 try:
@@ -1637,7 +1849,9 @@ class RaydiumAdapter:
                     receipts.append(_to_jsonable(conf))
                 except Exception as exc:
                     receipts.append({"warn": f"confirm failed: {exc}"})
+
         return {"signatures": signatures, "receipts": receipts}
+
     # ---------------- HTTP helpers (Raydium Trade API) ----------------
     def _api_get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Dict[str, Any]:
         import requests
@@ -2434,8 +2648,6 @@ class RaydiumAdapter:
             current_tick: Optional[int] = None
             if isinstance(pool_id, str) and pool_id:
                 current_tick = self.get_pool_tick_current(pool_id)
-                if current_tick is None:
-                    self.logger.warning("No se pudo extraer tickCurrent de la pool %s", pool_id)
             else:
                 self.logger.warning("pool_id inválido en posición: %s", pool_id)
             # 3) Unir y devolver
@@ -2473,6 +2685,490 @@ class RaydiumAdapter:
         return current_tick
 
 
+    # ---------------- Liquidity REMOVE (decrease + close) ----------------
+    def _read_position_core(self, position_nft_mint: str) -> Dict[str, Any]:
+        details: Dict[str, Any] = {}
+        try:
+            acc_name, _, _ = self.decoder.infer_position_offsets()
+        except Exception:
+            acc_name = "PersonalPosition"
+        pda, _bump = self._derive_personal_position_pda(position_nft_mint)
+        pos_b64 = self._get_account_info_base64(pda)
+        if not pos_b64:
+            return {}
+        details = self._decode_account(acc_name, pda, pos_b64)
+        if not isinstance(details, dict):
+            return {}
+        details["pda"] = pda
+        return details
+
+    def _extract_ticks_from_position(self, pos: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+        lower = None
+        upper = None
+        if not isinstance(pos, dict):
+            return lower, upper
+        for k in ("tick_lower_index", "tickLowerIndex", "tick_lower", "tickLower", "lower_tick", "lowerTick"):
+            if k in pos:
+                try:
+                    lower = int(pos[k]); break
+                except Exception:
+                    continue
+        for k in ("tick_upper_index", "tickUpperIndex", "tick_upper", "tickUpper", "upper_tick", "upperTick"):
+            if k in pos:
+                try:
+                    upper = int(pos[k]); break
+                except Exception:
+                    continue
+        return lower, upper
+
+    def _extract_liquidity_from_position(self, pos: Dict[str, Any]) -> Optional[int]:
+        if not isinstance(pos, dict):
+            return None
+        for k in ("liquidity", "position_liquidity", "liq"):
+            if k in pos:
+                try:
+                    return int(pos[k])
+                except Exception:
+                    continue
+        return None
+
+    def build_decrease_liquidity_v2_ix(
+        self,
+        pool_id: str,
+        position_nft_mint: str,
+        amount_liquidity: int,
+        amount0_min: int,
+        amount1_min: int,
+        recipient_token_account_0: Optional[str] = None,
+        recipient_token_account_1: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not pool_id:
+            raise ValueError("pool_id es obligatorio")
+        if not position_nft_mint:
+            raise ValueError("position_nft_mint es obligatorio")
+        # Estado de pool y vaults
+        pool_state = self.get_pool_state_decoded(pool_id)
+        vault0, vault1 = self.get_pool_vaults(pool_state)
+        if not vault0 or not vault1:
+            raise RuntimeError("No se pudieron determinar los vaults de la pool")
+        mint0, mint1 = self.get_pool_mints(pool_state)
+        # Posición
+        pos = self._read_position_core(position_nft_mint)
+        if not pos:
+            raise RuntimeError("No se pudo leer la posición on-chain")
+        person_pda = pos.get("pda") or self._derive_personal_position_pda(position_nft_mint)[0]
+        # Ticks para tick arrays
+        tick_lower, tick_upper = self._extract_ticks_from_position(pos)
+        if tick_lower is None or tick_upper is None:
+            raise RuntimeError("No fue posible extraer ticks de la posición")
+        spacing = None
+        for k in ("tick_spacing", "tickSpacing", "tick_spacing_index"):
+            if pool_state.get(k) is not None:
+                try:
+                    spacing = int(pool_state.get(k)); break
+                except Exception:
+                    pass
+        if spacing is None:
+            raise RuntimeError("No se pudo determinar tickSpacing de la pool")
+        start_lo = self.compute_tick_array_start_index(tick_lower, spacing)
+        start_hi = self.compute_tick_array_start_index(tick_upper, spacing)
+        ta_lo, _ = self.derive_tick_array_pda(pool_id, start_lo)
+        ta_hi, _ = self.derive_tick_array_pda(pool_id, start_hi)
+        proto_pos, _pb = self.derive_protocol_position_pda(pool_id, tick_lower, tick_upper)
+        # Recipient accounts
+        recv0 = recipient_token_account_0
+        recv1 = recipient_token_account_1
+        if not recv0:
+            if self._is_sol_mint(mint0):
+                try:
+                    import hashlib as _hl  # type: ignore
+                    from solders.pubkey import Pubkey  # type: ignore
+                    seed_raw = _hl.sha256((position_nft_mint + ":wsol").encode("utf-8")).hexdigest()[:32]
+                    base_pk = Pubkey.from_string(self.owner_pubkey)
+                    token_prog_pk = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                    recv0 = str(Pubkey.create_with_seed(base_pk, seed_raw, token_prog_pk))
+                except Exception:
+                    recv0 = self._derive_ata(self.owner_pubkey, self.SOL_MINT)
+            else:
+                recv0 = self._derive_ata(self.owner_pubkey, mint0)
+        if not recv1:
+            recv1 = self._derive_ata(self.owner_pubkey, mint1)
+        # Reward accounts (triples vault->mint->owner_ata): SOLO activas (sin placeholders)
+        reward_triples: List[Tuple[str, str, str]] = []
+        try:
+            rewards = pool_state.get("reward_infos") or pool_state.get("rewardInfos") or []
+            default_pk = "11111111111111111111111111111111"
+            if isinstance(rewards, list):
+                for info in rewards:
+                    i = (info or {})
+                    # determinar si está activa
+                    state = i.get("reward_state") or i.get("rewardState")
+                    open_time = i.get("open_time") or i.get("openTime")
+                    end_time = i.get("end_time") or i.get("endTime")
+                    emission = i.get("emissions_per_second_x64") or i.get("emissionsPerSecondX64") or 0
+                    try:
+                        import time as _t  # type: ignore
+                        now_ts = int(_t.time())
+                        em_int = int(emission)
+                        in_window = True
+                        if open_time is not None and int(open_time) > 0:
+                            in_window = in_window and (now_ts >= int(open_time))
+                        if end_time is not None and int(end_time) > 0:
+                            in_window = in_window and (now_ts <= int(end_time))
+                        is_active = (str(state) == "2") or (em_int > 0 and in_window)
+                    except Exception:
+                        is_active = (str(state) == "2")
+                    rmint = (
+                        i.get("mint")
+                        or i.get("reward_mint")
+                        or i.get("rewardMint")
+                        or i.get("token_mint")
+                        or i.get("tokenMint")
+                    )
+                    rvault = (
+                        i.get("vault")
+                        or i.get("vaultAddress")
+                        or i.get("reward_vault")
+                        or i.get("rewardVault")
+                        or i.get("token_vault")
+                        or i.get("tokenVault")
+                        or i.get("token_vault_address")
+                        or i.get("token_vault")
+                    )
+                    if (
+                        is_active and
+                        isinstance(rmint, str) and isinstance(rvault, str) and rmint != default_pk and rvault != default_pk
+                    ):
+                        rdest = self._derive_ata(self.owner_pubkey, rmint)
+                        if not isinstance(rdest, str) or len(rdest) == 0:
+                            rdest = default_pk
+                        reward_triples.append((rvault, rmint, rdest))
+        except Exception:
+            reward_triples = []
+        try:
+            exp_len = len(rewards) if isinstance(rewards, list) else 0
+        except Exception:
+            exp_len = 0
+        self.logger.info(
+            "decrease_liquidity_v2: rewards_len=%s triples_len=%s triples=%s",
+            exp_len,
+            len(reward_triples),
+            " | ".join([f"{a}|{b}->{c}" for (a, b, c) in reward_triples])
+        )
+        # NFT token account (Token-2022)
+        pos_nft_ata = self._derive_ata(self.owner_pubkey, position_nft_mint, token_program_id="TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+        # Asegurar que los ATAs de rewards existen: programar creación previa si faltan
+        ensure_reward_atas: List[Dict[str, Any]] = []
+        for (_rvault, _rmint, rdest) in reward_triples:
+            try:
+                # Recuperar mint desde el vault consultando la pool si es necesario
+                # Aquí ya tenemos el mint en el par derivado; no es trivial mapear
+                # así que inferimos mint del ATA destino rdest si coincide la derivación
+                # En su defecto, omitimos create_ata y asumimos que existe
+                if not self._ata_exists(rdest):
+                    # No conocemos el mint directamente aquí, así que no añadimos create_ata ciego
+                    # El programa fallaría con AccountNotFound si no existe; el caller debería crearlo fuera
+                    pass
+            except Exception:
+                continue
+        # Data
+        ix_name = "decrease_liquidity_v2"
+        data = b"".join([
+            self._anchor_discriminator(ix_name),
+            self._encode_u128_le(int(amount_liquidity)),
+            self._encode_u64_le(int(amount0_min)),
+            self._encode_u64_le(int(amount1_min)),
+        ])
+        # Keys en el orden exacto esperado por el programa (evitar ambigüedad de mapeo)
+        token_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        token2022_program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+        memo_program = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+        keys: List[Dict[str, Any]] = [
+            {"pubkey": self.owner_pubkey, "is_signer": True, "is_writable": True},                    # nft_owner
+            {"pubkey": pos_nft_ata or "", "is_signer": False, "is_writable": True},                 # nft_account (Token-2022 ATA)
+            {"pubkey": person_pda, "is_signer": False, "is_writable": True},                         # personal_position
+            {"pubkey": pool_id, "is_signer": False, "is_writable": True},                            # pool_state
+            {"pubkey": proto_pos, "is_signer": False, "is_writable": True},                          # protocol_position
+            {"pubkey": vault0, "is_signer": False, "is_writable": True},                             # token_vault_0
+            {"pubkey": vault1, "is_signer": False, "is_writable": True},                             # token_vault_1
+            {"pubkey": ta_lo, "is_signer": False, "is_writable": True},                               # tick_array_lower
+            {"pubkey": ta_hi, "is_signer": False, "is_writable": True},                               # tick_array_upper
+            {"pubkey": recv0 or "", "is_signer": False, "is_writable": True},                       # recipient_token_account_0
+            {"pubkey": recv1 or "", "is_signer": False, "is_writable": True},                       # recipient_token_account_1
+            {"pubkey": token_program, "is_signer": False, "is_writable": False},                      # token_program
+            {"pubkey": token2022_program, "is_signer": False, "is_writable": False},                 # token_program_2022
+            {"pubkey": memo_program, "is_signer": False, "is_writable": False},                      # memo_program v2
+            {"pubkey": mint0 or "", "is_signer": False, "is_writable": False},                      # vault_0_mint
+            {"pubkey": mint1 or "", "is_signer": False, "is_writable": False},                      # vault_1_mint
+        ]
+        self.logger.info(
+            "decrease_liquidity_v2: base_keys=%s (hasta mints)",
+            len(keys)
+        )
+        # Añadir reward triples [vault, mint, ATA] después de los mints base
+        for (rvault, rmint, rdest) in reward_triples:
+            is_placeholder = (
+                str(rvault) == "11111111111111111111111111111111"
+                or str(rmint) == "11111111111111111111111111111111"
+                or str(rdest) == "11111111111111111111111111111111"
+            )
+            # Orden esperado por la UI de referencia: [vault, ATA, mint]
+            keys.append({"pubkey": rvault, "is_signer": False, "is_writable": (not is_placeholder)})
+            keys.append({"pubkey": rdest, "is_signer": False, "is_writable": (not is_placeholder)})
+            keys.append({"pubkey": rmint, "is_signer": False, "is_writable": False})
+        self.logger.info(
+            "decrease_liquidity_v2: total_keys=%s (incl. rewards=%s)",
+            len(keys),
+            len(reward_triples)
+        )
+        # Logging de rewards para diagnóstico
+        try:
+            if self.logger.isEnabledFor(logging.INFO):
+                rewards_dbg = pool_state.get("reward_infos") or pool_state.get("rewardInfos") or []
+                expected = 0
+                if isinstance(rewards_dbg, list):
+                    for j in rewards_dbg:
+                        st = (j or {}).get("reward_state") or (j or {}).get("rewardState")
+                        emis = (j or {}).get("emissions_per_second_x64") or (j or {}).get("emissionsPerSecondX64") or 0
+                        try:
+                            emis_i = int(emis)
+                        except Exception:
+                            emis_i = 0
+                        if str(st) == "2" or emis_i > 0:
+                            expected += 1
+                self.logger.info(
+                    "decrease_liquidity_v2: reward_triples_active=%d (expected_active~=%d) [%s]",
+                    len(reward_triples), expected, ",".join([f"{a}|{b}->{c}" for (a, b, c) in reward_triples])
+                )
+        except Exception:
+            pass
+        return {
+            "program_id": self.config.program_id_clmm,
+            "keys": keys,
+            "data": data,
+            "accounts": {
+                "pool": pool_id,
+                "personalPosition": person_pda,
+                "protocolPosition": proto_pos,
+                "tickArrays": {"lower": ta_lo, "upper": ta_hi},
+                "recipientTokenAccounts": {"A": recv0, "B": recv1},
+                "vaults": {"A": vault0, "B": vault1},
+                "positionNftMint": position_nft_mint,
+                "positionNftAccount": pos_nft_ata,
+                "rewardTriples": reward_triples,
+            },
+            "notes": [],
+        }
+
+    def build_close_position_ix(self, position_nft_mint: str) -> Dict[str, Any]:
+        if not position_nft_mint:
+            raise ValueError("position_nft_mint es obligatorio")
+        pos = self._read_position_core(position_nft_mint)
+        if not pos:
+            raise RuntimeError("No se pudo leer la posición on-chain")
+        person_pda = pos.get("pda") or self._derive_personal_position_pda(position_nft_mint)[0]
+        pos_nft_ata = self._derive_ata(self.owner_pubkey, position_nft_mint, token_program_id="TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+        ix_name = "close_position"
+        data = self._anchor_discriminator(ix_name)
+        # Keys explícitas en orden
+        keys: List[Dict[str, Any]] = [
+            {"pubkey": self.owner_pubkey, "is_signer": True, "is_writable": True},                    # nft_owner
+            {"pubkey": position_nft_mint, "is_signer": False, "is_writable": True},                   # position_nft_mint (Token-2022 Mint)
+            {"pubkey": pos_nft_ata or "", "is_signer": False, "is_writable": True},                 # position_nft_account (ATA 2022)
+            {"pubkey": person_pda, "is_signer": False, "is_writable": True},                          # personal_position
+            {"pubkey": "11111111111111111111111111111111", "is_signer": False, "is_writable": False}, # system_program
+            {"pubkey": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", "is_signer": False, "is_writable": False}, # token_2022
+        ]
+        return {
+            "program_id": self.config.program_id_clmm,
+            "keys": keys,
+            "data": data,
+            "accounts": {
+                "personalPosition": person_pda,
+                "positionNftMint": position_nft_mint,
+                "positionNftAccount": pos_nft_ata,
+            },
+            "notes": [],
+        }
+
+    def liquidity_prepare_remove(
+        self,
+        position_nft_mint: str,
+        pool_id: Optional[str],
+        slippage_bps: int = 0,
+        compute_unit_price_micro: int = 25_000,
+        compute_unit_limit: int = 600_000,
+    ) -> Dict[str, Any]:
+        # Leer posición y pool
+        pos = self._read_position_core(position_nft_mint)
+        if not pos:
+            return {"canSend": False, "error": "position not found", "notes": ["No se pudo leer la posición on-chain"]}
+        pool = pool_id or pos.get("pool_id")
+        if not isinstance(pool, str) or not pool:
+            return {"canSend": False, "error": "pool id missing", "notes": ["Falta pool_id"]}
+        # Liquidez a remover: por defecto 100%
+        liq = self._extract_liquidity_from_position(pos)
+        if liq is None:
+            return {"canSend": False, "error": "liquidity missing", "notes": ["No se pudo extraer liquidity de la posición"]}
+        # Mínimos: por simplicidad, 0
+        a_min = 0
+        b_min = 0
+        # Destinatarios: cuenta WSOL temporal con seed + ATA USDC del owner
+        pool_state = self.get_pool_state_decoded(pool)
+        mint0, mint1 = self.get_pool_mints(pool_state)
+        # Derivar cuenta WSOL temporal (no ATA) con seed determinista
+        recv0 = None
+        wsol_seed = None
+        wsol_new_account = None
+        if self._is_sol_mint(mint0):
+            import hashlib
+            seed_raw = hashlib.sha256((position_nft_mint + ":wsol").encode("utf-8")).hexdigest()[:32]
+            wsol_seed = seed_raw
+            # Derivar la dirección exacta con create_with_seed(base=owner, seed, owner=Token Program)
+            try:
+                from solders.pubkey import Pubkey  # type: ignore
+                base_pk = Pubkey.from_string(self.owner_pubkey)
+                token_prog_pk = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                new_pk = Pubkey.create_with_seed(base_pk, wsol_seed, token_prog_pk)
+                recv0 = str(new_pk)
+            except Exception:
+                # Si no podemos derivarla aquí, mantenemos None para forzar error explícito
+                recv0 = None
+        recv1 = self._derive_ata(self.owner_pubkey, mint1)
+        # Planear unwrap post para WSOL temporal
+        prewrap: List[Dict[str, Any]] = []
+        postunwrap: List[Dict[str, Any]] = []
+        createATAs: List[Dict[str, Any]] = []
+        createWithSeed: List[Dict[str, Any]] = []
+        if self._is_sol_mint(mint0) and wsol_seed and isinstance(recv0, str) and len(recv0) > 0:
+            # Estimación mínima de rent para una cuenta de token (165 bytes) + margen
+            rent_lamports = 2_039_280  # aproximado, actualizado por RPC si se quiere
+            createWithSeed.append({
+                "base": self.owner_pubkey,
+                "seed": wsol_seed,
+                "newAccount": recv0,
+                "lamports": rent_lamports,
+            })
+            postunwrap.append({"kind": "unwrap", "ata": recv0})
+        # Construir ix decrease
+        try:
+            ix_dec = self.build_decrease_liquidity_v2_ix(
+                pool_id=pool,
+                position_nft_mint=position_nft_mint,
+                amount_liquidity=int(liq),
+                amount0_min=int(a_min),
+                amount1_min=int(b_min),
+                recipient_token_account_0=recv0,
+                recipient_token_account_1=recv1,
+            )
+        except Exception as exc:
+            return {"canSend": False, "error": str(exc), "notes": [str(exc)]}
+        cb = {"microLamports": int(compute_unit_price_micro), "units": int(compute_unit_limit)}
+        anc_dec = {"anchor": {"ix": ix_dec, "computeBudget": cb, "prewrap": prewrap, "postunwrap": postunwrap, "createATAs": createATAs, "createWithSeed": createWithSeed}}
+        # Añadir close_position como extraIxs en la misma transacción que decrease
+        try:
+            ix_close = self.build_close_position_ix(position_nft_mint)
+        except Exception as exc2:
+            return {"canSend": False, "error": str(exc2), "notes": [str(exc2)]}
+        anc_dec["anchor"]["extraIxs"] = [ix_close]
+        tx1_b64, extras1 = self._assemble_v0_from_anchor(anc_dec)
+        return {
+            "canSend": True,
+            "transactions": [tx1_b64],
+            "extraSigners": extras1 or [],
+            "meta": {"poolId": pool, "position": position_nft_mint},
+            "notes": [],
+        }
+
+    def liquidity_prepare_open(
+        self,
+        pool_id: str,
+        tick_lower: int,
+        tick_upper: int,
+        mintA: str,
+        mintB: str,
+        user_token_account_a: Optional[str] = None,
+        user_token_account_b: Optional[str] = None,
+        slippage_bps: int = 100,
+        with_metadata: bool = True,
+        base_flag: Optional[bool] = False,
+        compute_unit_price_micro: int = 25_000,
+        compute_unit_limit: int = 600_000,
+    ) -> Dict[str, Any]:
+        # Derivar ATAs si no se pasan; para SOL usar ATA de WSOL del owner (auto-wrap)
+        ata_a = user_token_account_a or (self._derive_ata(self.owner_pubkey, mintA) if not self._is_sol_mint(mintA) else self._derive_ata(self.owner_pubkey, self.SOL_MINT))
+        ata_b = user_token_account_b or (self._derive_ata(self.owner_pubkey, mintB) if not self._is_sol_mint(mintB) else self._derive_ata(self.owner_pubkey, self.SOL_MINT))
+        # Leer balances exactos (si aún no existen ATAs, balance 0)
+        bal_a = self._get_token_account_balance_int(ata_a) if ata_a else 0
+        bal_b = self._get_token_account_balance_int(ata_b) if ata_b else 0
+        def with_margin(x: int) -> int:
+            try:
+                bps = max(0, int(slippage_bps))
+                return int((x * (10_000 + bps)) // 10_000)
+            except Exception:
+                return int(x)
+        amount0_max = with_margin(int(bal_a or 0))
+        amount1_max = with_margin(int(bal_b or 0))
+        # Crear listas de prewrap/postunwrap/createATAs para auto WSOL y ATAs faltantes
+        prewrap: List[Dict[str, Any]] = []
+        postunwrap: List[Dict[str, Any]] = []
+        createATAs: List[Dict[str, Any]] = []
+        # Asegurar ATAs para mints no-SOL si faltan
+        if not self._is_sol_mint(mintA):
+            try:
+                ata_chk = self._derive_ata(self.owner_pubkey, mintA)
+                exists = self._ata_exists(ata_chk)
+                if exists is False:
+                    createATAs.append({"owner": self.owner_pubkey, "mint": mintA})
+            except Exception:
+                pass
+        if not self._is_sol_mint(mintB):
+            try:
+                ata_chk = self._derive_ata(self.owner_pubkey, mintB)
+                exists = self._ata_exists(ata_chk)
+                if exists is False:
+                    createATAs.append({"owner": self.owner_pubkey, "mint": mintB})
+            except Exception:
+                pass
+        # Preparar wrap/unwrap para lados SOL usando el ATA WSOL
+        if self._is_sol_mint(mintA) and isinstance(ata_a, str):
+            try:
+                exists = self._ata_exists(ata_a)
+                if exists is False:
+                    createATAs.append({"owner": self.owner_pubkey, "mint": self.SOL_MINT})
+            except Exception:
+                pass
+            prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": ata_a, "lamports": int(amount0_max)})
+            postunwrap.append({"kind": "unwrap", "ata": ata_a})
+        if self._is_sol_mint(mintB) and isinstance(ata_b, str):
+            try:
+                exists = self._ata_exists(ata_b)
+                if exists is False:
+                    createATAs.append({"owner": self.owner_pubkey, "mint": self.SOL_MINT})
+            except Exception:
+                pass
+            prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": ata_b, "lamports": int(amount1_max)})
+            postunwrap.append({"kind": "unwrap", "ata": ata_b})
+        try:
+            ix = self.build_open_position_with_token22_ix(
+                pool_id=pool_id,
+                mintA=mintA,
+                mintB=mintB,
+                tick_lower=int(tick_lower),
+                tick_upper=int(tick_upper),
+                amount0_max=int(amount0_max),
+                amount1_max=int(amount1_max),
+                with_metadata=with_metadata,
+                base_flag=base_flag,
+                token_account_a=ata_a,
+                token_account_b=ata_b,
+            )
+        except Exception as exc:
+            return {"canSend": False, "error": str(exc), "notes": [str(exc)]}
+        cb = {"microLamports": int(compute_unit_price_micro), "units": int(compute_unit_limit)}
+        anc = {"anchor": {"ix": ix, "computeBudget": cb, "prewrap": prewrap, "postunwrap": postunwrap, "createATAs": createATAs}}
+        tx_b64, extras = self._assemble_v0_from_anchor(anc)
+        return {"canSend": True, "transactions": [tx_b64], "extraSigners": extras or [], "meta": {"poolId": pool_id}, "notes": ix.get("notes") or []}
 __all__ = ["RaydiumAdapter", "RaydiumConfig"]
 
 
