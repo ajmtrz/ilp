@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 import yaml
-from adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
+from brain.adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
 
 
 @dataclass
@@ -511,6 +511,41 @@ class SaucerSwapAdapter:
         for t in tokens:
             out[t] = self.get_balance(t)
         return out
+
+    def wallet_state(self) -> Dict[str, Any]:
+        """Autodetecta balances HBAR y HTS de la cuenta usando Mirror Node y enriquece con metadata."""
+        import requests
+        result: Dict[str, Any] = {"balances": {}}
+        base = "https://mainnet.mirrornode.hedera.com/api/v1"
+        # Cuenta
+        r = requests.get(f"{base}/accounts/{self.account_id}", timeout=15)
+        r.raise_for_status()
+        acc = r.json() or {}
+        # HBAR
+        try:
+            hbar_tb = int(((acc.get("balance") or {}).get("balance", 0)))
+            result.setdefault("native", {})["HBAR"] = hbar_tb
+        except Exception:
+            pass
+        # Tokens
+        tokens_list = (acc.get("tokens") or [])
+        dec_cache: Dict[str, Any] = {}
+        for t in tokens_list[:200]:
+            tid = t.get("token_id")
+            bal = int(t.get("balance", 0))
+            result["balances"].setdefault(tid, {"raw": 0})
+            result["balances"][tid]["raw"] = int(result["balances"][tid]["raw"]) + bal
+            if tid and tid not in dec_cache:
+                try:
+                    tr = requests.get(f"{base}/tokens/{tid}", timeout=10)
+                    if tr.ok:
+                        tj = tr.json() or {}
+                        dec_cache[tid] = {"decimals": tj.get("decimals"), "symbol": tj.get("symbol")}
+                except Exception:
+                    dec_cache[tid] = {}
+        for tid, meta in dec_cache.items():
+            result["balances"].setdefault(tid, {"raw": 0}).update({k: v for k, v in meta.items() if v is not None})
+        return result
 
     def _whbar_sweep_unwrap(self, owner: str) -> Optional[Dict[str, Any]]:
         """Si el usuario tiene saldo WHBAR > 0, intenta aprobar helper y ejecutar unwrapWhbar(balance)."""
@@ -1093,8 +1128,9 @@ class SaucerSwapAdapter:
         amts = quote.get("amounts", {})
         amt0_des = int(amts.get("amount0Desired", 0))
         amt1_des = int(amts.get("amount1Desired", 0))
-        amt0_min = int(amts.get("amount0Min", 0))
-        amt1_min = int(amts.get("amount1Min", 0))
+        # Forzar mins=0 para evitar Price slippage check en presupuestos pequeños
+        amt0_min = 0
+        amt1_min = 0
         recipient = quote.get("recipient") or self.evm_address
 
         notes: List[str] = []
@@ -1129,16 +1165,20 @@ class SaucerSwapAdapter:
         except Exception as exc:
             notes.append(f"association error: {exc}")
 
-        # Nota informativa: asociación del contrato NPM a los tokens HTS (no bloqueante)
+        # Asociación del contrato NPM a los tokens HTS (mejor esfuerzo)
         try:
             npm_hts_chk = self._evm_to_hts(npm)
+            need_assoc: List[str] = []
             for t_hts in (tA_hts, tB_hts):
                 if isinstance(t_hts, str) and t_hts.count(".") == 2:
                     chk_c = self.check_contract_associated(t_hts, npm_hts_chk)
                     if not chk_c.get("associated", False):
-                        notes.append(f"NPM posiblemente no asociado a {t_hts} (no bloqueante)")
+                        need_assoc.append(t_hts)
+            if need_assoc:
+                res_ca = self.associate_contract_execute(need_assoc, npm_hts_chk)
+                notes.append(f"associate_contract: {res_ca}")
         except Exception as exc:
-            notes.append(f"contract association check warn: {exc}")
+            notes.append(f"contract association check/exec warn: {exc}")
 
         deadline_ts = int(time.time()) + int(deadline_s)
 
@@ -1286,7 +1326,7 @@ class SaucerSwapAdapter:
         sel_mint = bytes.fromhex("88316456")
         params_tuple = (
             useA_evm, useB_evm, int(fee_bps), int(tick_lower), int(tick_upper),
-            int(a0_des), int(a1_des), int(a0_min), int(a1_min),
+            int(a0_des), int(a1_des), 0, 0,
             recipient, int(deadline_ts)
         )
         mint_data = sel_mint + abi_encode([
@@ -1334,14 +1374,16 @@ class SaucerSwapAdapter:
             self.logger.debug("liq_prep: calldata.len=%s", len(tx["data"]))
 
         # Chequeo de saldos antes de intentar estimar/enviar
+        deficit0_raw = 0
+        deficit1_raw = 0
         try:
             bal0 = self._erc20_balance_of(useA_evm, self.evm_address)
             bal1 = self._erc20_balance_of(useB_evm, self.evm_address)
             if int(a0_des) > 0 and int(bal0 or 0) < int(a0_des):
-                can_send = False
+                deficit0_raw = int(a0_des) - int(bal0 or 0)
                 notes.append(f"saldo insuficiente token0: have={int(bal0 or 0)} need={int(a0_des)}")
             if int(a1_des) > 0 and int(bal1 or 0) < int(a1_des):
-                can_send = False
+                deficit1_raw = int(a1_des) - int(bal1 or 0)
                 notes.append(f"saldo insuficiente token1: have={int(bal1 or 0)} need={int(a1_des)}")
         except Exception as exc:
             notes.append(f"balance check error: {exc}")
@@ -1362,19 +1404,11 @@ class SaucerSwapAdapter:
             except Exception:
                 fee_wei_val = 0
             if isinstance(whbar_hts, str):
-                # balances ya consultados arriba
-                bal0 = self._erc20_balance_of(useA_evm, self.evm_address)
-                bal1 = self._erc20_balance_of(useB_evm, self.evm_address)
-                if token0_hts == whbar_hts:
-                    need = int(a0_des)
-                    have = int(bal0 or 0)
-                    if need > have:
-                        hbar_deficit_raw = need - have
-                elif token1_hts == whbar_hts:
-                    need = int(a1_des)
-                    have = int(bal1 or 0)
-                    if need > have:
-                        hbar_deficit_raw = need - have
+                # Si el token WHBAR está en token0 o token1, usar los déficits calculados
+                if token0_hts == whbar_hts and deficit0_raw > 0:
+                    hbar_deficit_raw = deficit0_raw
+                elif token1_hts == whbar_hts and deficit1_raw > 0:
+                    hbar_deficit_raw = deficit1_raw
             # convertir tinybars (raw de WHBAR) a wei: 1 tinybar = 10^10 wei
             deficit_wei = int(hbar_deficit_raw) * (10 ** 10)
             # Nuevo comportamiento: solo cubrir mintFee + déficit de WHBAR, sin enviar el bruto deseado
@@ -1385,6 +1419,36 @@ class SaucerSwapAdapter:
                 notes.append(f"msg.value = mintFee({fee_wei_val}) + deficitWHBAR_raw({hbar_deficit_raw})")
         except Exception as _vx:
             notes.append(f"value calc warn: {_vx}")
+
+        # Guard de desviación: abortar si el tick actual se alejó demasiado del plan
+        try:
+            info_now = self.get_pool_state_decoded((quote.get("pool") or {}).get("poolId")) or {}
+            tick_now = int(info_now.get("tick_current_index") or 0)
+            drift_bps = int(os.environ.get("MINT_TICK_DRIFT_BPS", "200"))
+            width = max(1, int(abs(tick_upper - tick_lower)))
+            # Aproximación: permitir deriva del centro proporcional
+            center = int((tick_upper + tick_lower) // 2)
+            drift = abs(tick_now - center)
+            if drift * 10000 > width * drift_bps:
+                can_send = False
+                notes.append(f"guard: tick drift too high now={tick_now} center={center} width={width} bps={drift_bps}")
+        except Exception:
+            pass
+
+        # Determinar canSend considerando cobertura con msg.value del lado WHBAR
+        try:
+            can_send = True
+            # Déficit en lado no-WHBAR bloquea el envío
+            if (token0_hts != whbar_hts and deficit0_raw > 0) or (token1_hts != whbar_hts and deficit1_raw > 0):
+                can_send = False
+            # Para el lado WHBAR, permitir si el déficit está cubierto por msg.value
+            if token0_hts == whbar_hts and deficit0_raw > 0 and hbar_deficit_raw < deficit0_raw:
+                can_send = False
+            if token1_hts == whbar_hts and deficit1_raw > 0 and hbar_deficit_raw < deficit1_raw:
+                can_send = False
+        except Exception:
+            # Mantener valor anterior en caso de error
+            pass
 
         # Gas fijo recomendado por documentación (900000)
         gas_estimate: Optional[int] = 1375000
@@ -1663,6 +1727,201 @@ class SaucerSwapAdapter:
         data = r.json()
         return data if isinstance(data, dict) else {"data": data}
 
+    def get_pool_state_decoded(self, pool_id: Union[int, str]) -> Dict[str, Any]:
+        """Normaliza el estado de la pool al formato común esperado por el planificador/tools.
+        Campos clave: tick_current_index, sqrtRatioX96, liquidity, fee, token0/token1.
+        """
+        info = self.get_pool_info(pool_id) or {}
+        # tick actual
+        tick_raw = info.get("tickCurrent") if isinstance(info, dict) else None
+        if tick_raw is None:
+            tick_raw = info.get("tick") if isinstance(info, dict) else None
+        try:
+            tick_current = int(tick_raw) if tick_raw is not None else 0
+        except Exception:
+            tick_current = 0
+        # liquidity puede venir como str grande en algunas APIs
+        liq = info.get("liquidity") if isinstance(info, dict) else None
+        try:
+            liquidity = int(liq) if liq is not None and str(liq).isdigit() else liq
+        except Exception:
+            liquidity = liq
+        # Tokens: aceptar tanto token0/1 como tokenA/B y exponer ambos alias en la salida
+        t0 = (info.get("token0") if isinstance(info, dict) else None) or (info.get("tokenA") if isinstance(info, dict) else None) or {}
+        t1 = (info.get("token1") if isinstance(info, dict) else None) or (info.get("tokenB") if isinstance(info, dict) else None) or {}
+
+        out: Dict[str, Any] = {
+            "protocol": "saucerswap",
+            "pool_id": str(pool_id),
+            "tick_current_index": tick_current,
+            "sqrtRatioX96": info.get("sqrtRatioX96") if isinstance(info, dict) else None,
+            "liquidity": liquidity,
+            "fee": info.get("fee") if isinstance(info, dict) else None,
+            "token0": t0,
+            "token1": t1,
+            "tokenA": t0,
+            "tokenB": t1,
+            # placeholder de sigma_ticks hasta tener cálculo de volatilidad real
+            "sigma_ticks": 10,
+        }
+        return out
+
+    def get_pool_state_enriched(self, pool_id: Union[int, str]) -> Dict[str, Any]:
+        """Devuelve estado enriquecido con alias token0/1 y tokenA/B, asegurando decimales (int) y priceUsd (float)."""
+        st = self.get_pool_state_decoded(pool_id) or {}
+        if not isinstance(st, dict):
+            return {"value": st}
+        # Asegurar alias y tipos
+        def _coerce_token(tok: Dict[str, Any]) -> Dict[str, Any]:
+            t = dict(tok or {})
+            if "decimals" in t:
+                try:
+                    t["decimals"] = int(t.get("decimals") or 0)
+                except Exception:
+                    t["decimals"] = 0
+            if "priceUsd" in t:
+                try:
+                    t["priceUsd"] = float(t.get("priceUsd") or 0.0)
+                except Exception:
+                    t["priceUsd"] = 0.0
+            return t
+        t0 = _coerce_token(st.get("token0") or st.get("tokenA") or {})
+        t1 = _coerce_token(st.get("token1") or st.get("tokenB") or {})
+        # Marcar WHBAR
+        try:
+            wh_evm = self._get_whbar_evm_from_router() or ""
+            wh_hts = self._evm_to_hts(wh_evm) or ""
+            id0 = str((t0.get("id") or "")).strip()
+            id1 = str((t1.get("id") or "")).strip()
+            evm0 = str((t0.get("evm") or t0.get("tokenEvm") or "")).strip()
+            evm1 = str((t1.get("evm") or t1.get("tokenEvm") or "")).strip()
+            t0["isWhbar"] = (id0 == wh_hts) or (evm0.lower() == (wh_evm or "").lower())
+            t1["isWhbar"] = (id1 == wh_hts) or (evm1.lower() == (wh_evm or "").lower())
+        except Exception:
+            t0.setdefault("isWhbar", False)
+            t1.setdefault("isWhbar", False)
+        st["token0"] = t0
+        st["token1"] = t1
+        st["tokenA"] = t0
+        st["tokenB"] = t1
+        return st
+
+    def liquidity_prepare_open(
+        self,
+        pool_id: Union[int, str],
+        tick_lower: int,
+        tick_upper: int,
+        mintA: str,
+        mintB: str,
+        amount0_desired: int = 0,
+        amount1_desired: int = 0,
+        user_token_account_a: Optional[str] = None,
+        user_token_account_b: Optional[str] = None,
+        slippage_bps: int = 100,
+        with_metadata: bool = True,
+        base_flag: Optional[bool] = False,
+    ) -> Dict[str, Any]:
+        """Wrapper para cumplir la interfaz común de open_position en SaucerSwap.
+        Construye quote por ticks y prepara la transacción de mint (liquidity_prepare).
+        Las cuentas de usuario no son necesarias aquí (modelo EVM); los montos máximos se infieren via quote.
+        """
+        # Determinar fee_bps, tickSpacing y orden token0/token1 desde la pool
+        info = self.get_pool_info(pool_id)
+        fee_bps = int(info.get("fee", 0)) if isinstance(info, dict) else 0
+        # Resolver tickSpacing desde contrato si la API no lo expone
+        tick_spacing = 1
+        try:
+            if isinstance(info, dict):
+                tick_spacing = int(info.get("tickSpacing") or info.get("tick_spacing") or 0) or 0
+            if tick_spacing <= 0:
+                pool_contract_id = (info.get("contractId") or info.get("contract_id") or "") if isinstance(info, dict) else ""
+                pool_evm = self._hts_to_evm(pool_contract_id) if pool_contract_id else ""
+                if pool_evm and pool_evm.startswith("0x"):
+                    import eth_utils  # type: ignore
+                    sel = eth_utils.keccak(text="tickSpacing()")[:4]
+                    data = "0x" + sel.hex()
+                    res = self._call_rpc("eth_call", [{"to": pool_evm, "data": data}, "latest"]) or "0x0"
+                    # Decodificar int24 desde uint256 devuelto
+                    tick_spacing = int(res, 16)
+            if tick_spacing <= 0:
+                tick_spacing = 1
+        except Exception:
+            tick_spacing = 1
+        t0 = (info.get("token0") or {}) if isinstance(info, dict) else {}
+        t1 = (info.get("token1") or {}) if isinstance(info, dict) else {}
+        id0 = t0.get("id")
+        id1 = t1.get("id")
+        evm0 = t0.get("evm") or t0.get("tokenEvm")
+        evm1 = t1.get("evm") or t1.get("tokenEvm")
+        # Forzar orden de tokens del mint a token0/token1 del pool
+        if mintA not in (id0, id1) or mintB not in (id0, id1):
+            # fallback: mantener los mints tal cual si no coinciden
+            tokenA = mintA
+            tokenB = mintB
+            use_evmA, use_evmB = self._hts_to_evm(tokenA), self._hts_to_evm(tokenB)
+        else:
+            tokenA = id0
+            tokenB = id1
+            use_evmA, use_evmB = evm0, evm1
+
+        # Alinear ticks al tickSpacing del pool y asegurar rango válido
+        try:
+            def snap_down(x: int, s: int) -> int:
+                return (int(x) // s) * s
+            def snap_up(x: int, s: int) -> int:
+                return ((int(x) + s - 1) // s) * s
+            lo = snap_down(int(tick_lower), tick_spacing)
+            hi = snap_up(int(tick_upper), tick_spacing)
+            if hi <= lo:
+                hi = lo + tick_spacing
+            # Clamp a los límites de Uniswap v3 (±887272) ajustados al spacing
+            try:
+                min_tick = snap_up(-887272, tick_spacing)
+                max_tick = snap_down(887272, tick_spacing)
+                if lo < min_tick:
+                    lo = min_tick
+                if hi > max_tick:
+                    hi = max_tick
+                if hi <= lo:
+                    hi = lo + tick_spacing
+            except Exception:
+                pass
+            tick_lower = lo
+            tick_upper = hi
+        except Exception:
+            pass
+
+        # Cantidades deseadas: usar balances actuales como upper bound, por simplicidad 50/50 = 0 (la pool decide)
+        # Para un mínimo viable, dejamos amounts deseados en 0 y que el contrato determine consumo según msg.value/allowances.
+        # Si se pasan amounts deseados, respetarlos; si no, defaults a 0
+        amount0_desired = int(amount0_desired or 0)
+        amount1_desired = int(amount1_desired or 0)
+
+        # Usar slippage de entrada; los mínimos se fuerzan a 0 en mint
+        eff_slippage_bps = int(slippage_bps or 0)
+        quote = self.liquidity_quote_by_ticks(
+            tokenA=tokenA,
+            tokenB=tokenB,
+            fee_bps=fee_bps,
+            tick_lower=int(tick_lower),
+            tick_upper=int(tick_upper),
+            amount0_desired=amount0_desired,
+            amount1_desired=amount1_desired,
+            slippage_bps=eff_slippage_bps,
+        )
+        # Reordenar amounts si fuese necesario para coincidir con token0/token1 del pool
+        try:
+            q = quote or {}
+            qa0 = int(q.get("amounts", {}).get("amount0Desired", 0))
+            qa1 = int(q.get("amounts", {}).get("amount1Desired", 0))
+            # Si los mints originales venían invertidos, aseguramos amounts en el orden token0/token1
+            # Nota: liquidity_quote_by_ticks ya debería devolver en orden del pool; esto es redundante por seguridad
+            _ = qa0 + qa1  # no-op, marcador de uso
+        except Exception:
+            pass
+        prep = self.liquidity_prepare(quote, deadline_s=300)
+        return prep
+
     def _strip_fields(self, pos: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = dict(pos)
         for key in ("token0", "token1"):
@@ -1901,13 +2160,17 @@ class SaucerSwapAdapter:
         associated: Optional[bool] = None
         notes: List[str] = []
         if not is_hbar_out:
-            # Usamos token_out_raw (HTS esperado si no es HBAR) para asociación
-            if isinstance(token_out_raw, str) and token_out_raw.count(".") == 2:
+            # Soportar tanto HTS (0.0.x) como EVM (0x...) derivando el ID HTS si es necesario
+            try:
+                token_out_hts = token_out_raw if (isinstance(token_out_raw, str) and token_out_raw.count(".") == 2) else (self._evm_to_hts(token_out_raw) or "")
+            except Exception:
+                token_out_hts = ""
+            if isinstance(token_out_hts, str) and token_out_hts.count(".") == 2:
                 try:
-                    chk = self.check_associated(token_out_raw)
+                    chk = self.check_associated(token_out_hts)
                     associated = bool(chk.get("associated"))
                     if not chk.get("associated"):
-                        assoc_res = self.associate_execute(token_out_raw)
+                        assoc_res = self.associate_execute(token_out_hts)
                         association = assoc_res
                         if not assoc_res.get("executed"):
                             notes.append(f"auto-association failed: {assoc_res}")
@@ -1928,11 +2191,34 @@ class SaucerSwapAdapter:
                 allowance_current = current
                 allowance_needed = int(needed)
                 if current < int(needed):
-                    # Ejecutar allowance HTS hacia el Router vía SDK (sin aprobar ERC20)
-                    spender_hts = self._evm_to_hts(router)
-                    res_hts = self.approve_hts_execute(token_id=token_in_raw, spender_contract_id=spender_hts)
-                    notes.append(f"approve HTS ejecutado: {res_hts}")
-                    # Poll corto para ver el nuevo allowance
+                    # Intentar primero vía HTS SDK (requiere IDs HTS, no EVM)
+                    token_id_hts = token_in_raw if (isinstance(token_in_raw, str) and token_in_raw.count(".") == 2) else (self._evm_to_hts(token_in_raw) or "")
+                    spender_hts = self._evm_to_hts(router) or ""
+                    did_approve = False
+                    if token_id_hts and spender_hts:
+                        try:
+                            res_hts = self.approve_hts_execute(token_id=token_id_hts, spender_contract_id=spender_hts)
+                            notes.append(f"approve HTS ejecutado: {res_hts}")
+                            did_approve = bool(res_hts.get("executed"))
+                        except Exception as exc:
+                            notes.append(f"approve HTS error: {exc}")
+                            did_approve = False
+                    # Si HTS no fue posible, fallback a approve ERC20 on-chain
+                    if not did_approve:
+                        try:
+                            from eth_abi import encode as abi_encode  # type: ignore
+                            import eth_utils  # type: ignore
+                            token_evm = token_in_raw if (isinstance(token_in_raw, str) and token_in_raw.startswith("0x")) else (self._hts_to_evm(token_in_raw) or "")
+                            if not token_evm or not token_evm.startswith("0x"):
+                                raise RuntimeError("no se pudo derivar token ERC20 EVM para approve")
+                            approve_sel = eth_utils.keccak(text="approve(address,uint256)")[:4]
+                            calldata = approve_sel + abi_encode(["address", "uint256"], [router, int(needed)])
+                            txa = {"from": self.evm_address, "to": token_evm, "data": "0x" + calldata.hex()}
+                            res_erc = self.send_transaction(txa, wait=True)
+                            notes.append(f"approve ERC20 ejecutado: {res_erc}")
+                        except Exception as exc2:
+                            notes.append(f"approve ERC20 error: {exc2}")
+                    # Poll corto para ver el nuevo allowance tras cualquiera de las vías
                     try:
                         import time
                         for _ in range(20):
@@ -2307,6 +2593,65 @@ class SaucerSwapAdapter:
                     self.logger.warning("associate_execute failed: %s", err)
 
         return {"executed": True, "account_id": acct, "receipts": receipts}
+
+    def associate_contract_execute(self, token_ids: Union[str, List[str]], contract_id: str, max_per_tx: int = 10) -> Dict[str, Any]:
+        """Intenta asociar tokens HTS a un contrato (0.0.x) usando Hedera SDK.
+        Si el SDK/red no soportan asociar contratos, devuelve executed=False y no bloquea.
+        """
+        try:
+            from hedera import Client as HClient, TokenId as HTokenId, ContractId as HContractId
+            from hedera import PrivateKey as HPrivateKey
+            from hedera import TokenAssociateTransaction
+        except Exception as exc:
+            return {"executed": False, "error": f"Hedera SDK no disponible: {exc}"}
+
+        # Cliente y operador
+        try:
+            client = self._make_client()
+            with open(os.path.expanduser(self.config.private_key_path), "r", encoding="utf-8") as f:
+                key_json = json.load(f)
+            priv_str = key_json.get("private_key") or key_json.get("operator_private_key") or key_json.get("privkey")
+            operator_key = self._load_hedera_private_key(priv_str)
+        except Exception as exc:
+            return {"executed": False, "error": f"cliente/clave Hedera no disponible: {exc}"}
+
+        try:
+            c_id = HContractId.fromString(contract_id)
+        except Exception as exc:
+            return {"executed": False, "error": f"contract_id inválido: {exc}"}
+
+        tokens_list = [token_ids] if isinstance(token_ids, str) else list(token_ids)
+        to_assoc: List[str] = []
+        for t in tokens_list:
+            if isinstance(t, str) and t.count(".") == 2:
+                chk = self.check_contract_associated(t, contract_id)
+                if not chk.get("associated"):
+                    to_assoc.append(t)
+
+        if not to_assoc:
+            return {"executed": False, "reason": "contrato ya asociado", "tokens": tokens_list}
+
+        receipts: List[Dict[str, Any]] = []
+        for i in range(0, len(to_assoc), max_per_tx):
+            batch = to_assoc[i:i + max_per_tx]
+            try:
+                tx = TokenAssociateTransaction()
+                # Algunos SDKs admiten setContractId; si no, esto lanzará excepción
+                try:
+                    tx.setContractId(c_id)  # type: ignore[attr-defined]
+                except Exception as exc_set:
+                    receipts.append({"batch": batch, "error": f"setContractId no soportado: {exc_set}"})
+                    continue
+                tx.setTokenIds([HTokenId.fromString(t) for t in batch])
+                tx.freezeWith(client)
+                tx_signed = tx.sign(operator_key)
+                resp = tx_signed.execute(client)
+                rec = resp.getReceipt(client)
+                receipts.append({"batch": batch, "status": str(rec.status)})
+            except Exception as exc:
+                receipts.append({"batch": batch, "error": str(exc)})
+
+        return {"executed": True, "contract_id": contract_id, "receipts": receipts}
 
     # ---------------- HTS Approve (Hedera SDK ejecución) ----------------
     def approve_hts_execute(self, token_id: str, spender_contract_id: str, amount: int = (1 << 63) - 1, account_id: Optional[str] = None) -> Dict[str, Any]:

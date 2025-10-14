@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import yaml
-from adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
+from brain.adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
 
 from .ClmmDecoder import ClmmDecoder
 
@@ -2793,15 +2793,14 @@ class RaydiumAdapter:
                 recv0 = self._derive_ata(self.owner_pubkey, mint0)
         if not recv1:
             recv1 = self._derive_ata(self.owner_pubkey, mint1)
-        # Reward accounts (triples vault->mint->owner_ata): SOLO activas (sin placeholders)
+        # Reward accounts (por defecto, recolectar ACTIVAS): triples [vault, ATA, mint]
         reward_triples: List[Tuple[str, str, str]] = []
+        rewards = []
         try:
             rewards = pool_state.get("reward_infos") or pool_state.get("rewardInfos") or []
-            default_pk = "11111111111111111111111111111111"
             if isinstance(rewards, list):
                 for info in rewards:
                     i = (info or {})
-                    # determinar si está activa
                     state = i.get("reward_state") or i.get("rewardState")
                     open_time = i.get("open_time") or i.get("openTime")
                     end_time = i.get("end_time") or i.get("endTime")
@@ -2818,33 +2817,53 @@ class RaydiumAdapter:
                         is_active = (str(state) == "2") or (em_int > 0 and in_window)
                     except Exception:
                         is_active = (str(state) == "2")
-                    rmint = (
-                        i.get("mint")
-                        or i.get("reward_mint")
-                        or i.get("rewardMint")
-                        or i.get("token_mint")
-                        or i.get("tokenMint")
-                    )
-                    rvault = (
-                        i.get("vault")
-                        or i.get("vaultAddress")
-                        or i.get("reward_vault")
-                        or i.get("rewardVault")
-                        or i.get("token_vault")
-                        or i.get("tokenVault")
-                        or i.get("token_vault_address")
-                        or i.get("token_vault")
-                    )
-                    if (
-                        is_active and
-                        isinstance(rmint, str) and isinstance(rvault, str) and rmint != default_pk and rvault != default_pk
-                    ):
-                        rdest = self._derive_ata(self.owner_pubkey, rmint)
-                        if not isinstance(rdest, str) or len(rdest) == 0:
-                            rdest = default_pk
-                        reward_triples.append((rvault, rmint, rdest))
+                    if not is_active:
+                        continue
+                    rmint = (i.get("reward_mint") or i.get("rewardMint") or i.get("mint") or i.get("token_mint") or i.get("tokenMint"))
+                    rvault = (i.get("reward_vault") or i.get("rewardVault") or i.get("vault") or i.get("token_vault") or i.get("tokenVault") or i.get("token_vault_address"))
+                    if not (isinstance(rmint, str) and isinstance(rvault, str) and rmint and rvault):
+                        continue
+                    rdest = self._derive_ata(self.owner_pubkey, rmint)
+                    if not isinstance(rdest, str) or not rdest:
+                        continue
+                    reward_triples.append((rvault, rdest, rmint))
         except Exception:
             reward_triples = []
+
+        # Asegurar número de cuentas esperado por el programa: si detectamos inconsistencia, forzar a expected_active
+        try:
+            expected = 0
+            if isinstance(rewards, list):
+                import time as _t  # type: ignore
+                now_ts = int(_t.time())
+                for j in rewards:
+                    st = (j or {}).get("reward_state") or (j or {}).get("rewardState")
+                    emis = (j or {}).get("emissions_per_second_x64") or (j or {}).get("emissionsPerSecondX64") or 0
+                    try:
+                        emis_i = int(emis)
+                    except Exception:
+                        emis_i = 0
+                    # Considerar activo si emite o estado==2
+                    if str(st) == "2" or emis_i > 0:
+                        expected += 1
+            if expected > 0 and len(reward_triples) != expected:
+                forced: List[Tuple[str, str, str]] = []
+                for info in (rewards or []):
+                    if len(forced) >= expected:
+                        break
+                    i = (info or {})
+                    rmint = (i.get("reward_mint") or i.get("rewardMint") or i.get("mint") or i.get("token_mint") or i.get("tokenMint"))
+                    rvault = (i.get("reward_vault") or i.get("rewardVault") or i.get("vault") or i.get("token_vault") or i.get("tokenVault") or i.get("token_vault_address"))
+                    if not (isinstance(rmint, str) and isinstance(rvault, str) and rmint and rvault):
+                        continue
+                    rdest = self._derive_ata(self.owner_pubkey, rmint)
+                    if not isinstance(rdest, str) or not rdest:
+                        continue
+                    forced.append((rvault, rdest, rmint))
+                if forced:
+                    reward_triples = forced
+        except Exception:
+            pass
         try:
             exp_len = len(rewards) if isinstance(rewards, list) else 0
         except Exception:
@@ -2905,14 +2924,13 @@ class RaydiumAdapter:
             "decrease_liquidity_v2: base_keys=%s (hasta mints)",
             len(keys)
         )
-        # Añadir reward triples [vault, mint, ATA] después de los mints base
-        for (rvault, rmint, rdest) in reward_triples:
+        # Añadir reward triples [vault, ATA, mint] después de los mints base
+        for (rvault, rdest, rmint) in reward_triples:
             is_placeholder = (
                 str(rvault) == "11111111111111111111111111111111"
                 or str(rmint) == "11111111111111111111111111111111"
                 or str(rdest) == "11111111111111111111111111111111"
             )
-            # Orden esperado por la UI de referencia: [vault, ATA, mint]
             keys.append({"pubkey": rvault, "is_signer": False, "is_writable": (not is_placeholder)})
             keys.append({"pubkey": rdest, "is_signer": False, "is_writable": (not is_placeholder)})
             keys.append({"pubkey": rmint, "is_signer": False, "is_writable": False})
@@ -3071,6 +3089,17 @@ class RaydiumAdapter:
         except Exception as exc2:
             return {"canSend": False, "error": str(exc2), "notes": [str(exc2)]}
         anc_dec["anchor"]["extraIxs"] = [ix_close]
+        # Crear ATAs para rewards si no existen
+        try:
+            rtrip = ((ix_dec.get("accounts") or {}).get("rewardTriples") or [])
+            for (_rvault, rdest, rmint) in rtrip:
+                try:
+                    if isinstance(rmint, str) and self._ata_exists(rdest) is False:
+                        createATAs.append({"owner": self.owner_pubkey, "mint": rmint})
+                except Exception:
+                    continue
+        except Exception:
+            pass
         tx1_b64, extras1 = self._assemble_v0_from_anchor(anc_dec)
         return {
             "canSend": True,

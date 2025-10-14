@@ -1,0 +1,37 @@
+models:
+  provider: ollama
+  name: gpt-oss:20b
+
+limits:
+  slippage_bps_max: 200
+  max_positions_per_protocol: 5
+
+circuit_breakers:
+  consecutive_fail_limit: 3
+  window_s: 120
+  cooldown_s: 60
+
+protocols:
+  raydium:
+    enabled: true
+    rpc_qps: 8
+    pools: # definir explícitamente por pool
+      "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv":
+        exposure_max: 0
+        slippage_bps: 100
+        budget_usd: 10          # capital objetivo para esta pool
+        min_notional: 1         # mínimo por lado para ejecutar
+        range_pct: 0.05         # rango +/-5% en ticks para Raydium
+        balance_before_mint: true # forzar pre-swaps para balancear a amounts deseados
+  saucerswap:
+    enabled: true
+    rpc_qps: 8
+    pools: # definir explícitamente por pool
+      "9":
+        exposure_max: 0
+        slippage_bps: 100
+        budget_usd: 10          # capital objetivo para esta pool
+        min_notional: 1         # mínimo por lado para ejecutar
+        balance_before_mint: true # mantener paridad de comportamiento
+
+
