@@ -156,8 +156,21 @@ def plan_actions(brain_cfg: Dict[str, Any], pool_states: Dict[str, Dict[str, Any
                     hbar_tb = int((wallet_states.get("saucerswap") or {}).get("native", {}).get("HBAR", 0))
                 except Exception:
                     hbar_tb = 0
+                # Reservar HBAR para wrap WHBAR (si aplica) + mintFee antes de planificar swaps desde HBAR
+                reserve_mint_tb = int(((brain_cfg.get("limits") or {}).get("hedera_mint_fee_tinybars", 30000000)))
+                wh_reserve_tb = 0
+                try:
+                    if is_wh0 and def0 > 0:
+                        # Si token0 es WHBAR: déficit en unidades con dec0; WHBAR usa 8 decimales (tinybars)
+                        wh_reserve_tb = int(def0 if dec0 == 8 else max(0, int(def0 / (10 ** max(dec0 - 8, 0)))))
+                    elif is_wh1 and def1 > 0:
+                        wh_reserve_tb = int(def1 if dec1 == 8 else max(0, int(def1 / (10 ** max(dec1 - 8, 0)))))
+                except Exception:
+                    wh_reserve_tb = 0
+                hbar_tb_available = max(0, int(hbar_tb) - int(reserve_mint_tb) - int(wh_reserve_tb))
                 planning_buffer_bps = int((brain_cfg.get("limits") or {}).get("planning_buffer_bps", 100))
-                if def0 > 0 and not is_wh0 and hbar_tb > 0 and isinstance(mint_a, str):
+                saucer_preswaps = bool(((brain_cfg.get("protocols") or {}).get("saucerswap") or {}).get("preswaps_enabled", False))
+                if saucer_preswaps and def0 > 0 and not is_wh0 and hbar_tb_available > 0 and isinstance(mint_a, str):
                     buf_out0 = int(math.ceil(def0 * (10000 + planning_buffer_bps) / 10000.0))
                     swap_intent = {
                         "intent": "swap",
@@ -173,7 +186,7 @@ def plan_actions(brain_cfg: Dict[str, Any], pool_states: Dict[str, Dict[str, Any
                     pre_swaps.append(swap_intent)
                     # Evitar añadir también un exact_in para este lado
                     def0 = 0
-                if def1 > 0 and not is_wh1 and hbar_tb > 0 and isinstance(mint_b, str):
+                if saucer_preswaps and def1 > 0 and not is_wh1 and hbar_tb_available > 0 and isinstance(mint_b, str):
                     buf_out1 = int(math.ceil(def1 * (10000 + planning_buffer_bps) / 10000.0))
                     swap_intent = {
                         "intent": "swap",
@@ -294,8 +307,8 @@ def plan_actions(brain_cfg: Dict[str, Any], pool_states: Dict[str, Dict[str, Any
                         "slippage_bps": int((brain_cfg.get("limits") or {}).get("slippage_bps_max", 100)),
                     })
                     def1 = 0
-            # Sourcing desde nativo en Hedera: usar HBAR -> WHBAR como fuente si también falta token del otro lado
-            if prot == "saucerswap":
+            # Sourcing desde nativo en Hedera (opcional): sólo si está habilitado preswaps
+            if prot == "saucerswap" and bool(((brain_cfg.get("protocols") or {}).get("saucerswap") or {}).get("preswaps_enabled", False)):
                 try:
                     # HBAR tinybars disponibles
                     hbar_tb = int((wallet_states.get("saucerswap") or {}).get("native", {}).get("HBAR", 0))

@@ -3132,7 +3132,8 @@ class RaydiumAdapter:
         bal_b = self._get_token_account_balance_int(ata_b) if ata_b else 0
         def with_margin(x: int) -> int:
             try:
-                bps = max(0, int(slippage_bps))
+                # Aumentar margen efectivo para evitar 6021: usar slippage_bps + 100 (1% extra)
+                bps = max(0, int(slippage_bps) + 100)
                 return int((x * (10_000 + bps)) // 10_000)
             except Exception:
                 return int(x)
@@ -3167,7 +3168,8 @@ class RaydiumAdapter:
                     createATAs.append({"owner": self.owner_pubkey, "mint": self.SOL_MINT})
             except Exception:
                 pass
-            prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": ata_a, "lamports": int(amount0_max)})
+            # Añadir pequeño buffer de wrap (0.002 SOL) para cubrir SyncNative/fees mínimas
+            prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": ata_a, "lamports": int(amount0_max) + 2000000})
             postunwrap.append({"kind": "unwrap", "ata": ata_a})
         if self._is_sol_mint(mintB) and isinstance(ata_b, str):
             try:
@@ -3176,7 +3178,7 @@ class RaydiumAdapter:
                     createATAs.append({"owner": self.owner_pubkey, "mint": self.SOL_MINT})
             except Exception:
                 pass
-            prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": ata_b, "lamports": int(amount1_max)})
+            prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": ata_b, "lamports": int(amount1_max) + 2000000})
             postunwrap.append({"kind": "unwrap", "ata": ata_b})
         try:
             ix = self.build_open_position_with_token22_ix(

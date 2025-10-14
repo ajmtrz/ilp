@@ -765,38 +765,21 @@ class SaucerSwapAdapter:
         }
 
     def get_mint_fee(self) -> Dict[str, Any]:
-        # 1) Obtener tinycent on-chain (Factory.mintFee() o MasterChef.depositFee())
+        # Obtener tinycent on-chain exclusivamente vía MasterChef
         try:
             import eth_utils  # type: ignore
             from eth_abi import decode as abi_decode  # type: ignore
         except Exception as exc:
             raise RuntimeError(f"Dependencias faltantes para fee: {exc}")
 
-        if not (self._factory_evm or self._master_chef_addr):
-            raise RuntimeError("factory_v2 o master_chef deben estar configurados en YAML")
+        if not self._master_chef_addr:
+            raise RuntimeError("master_chef debe estar configurado en YAML")
 
-        tinycent = None
-        # Factory.mintFee() -> tinycent
-        if self._factory_evm:
-            try:
-                sel_mf = eth_utils.keccak(text="mintFee()")[:4]
-                res_mf = self._call_rpc("eth_call", [{"to": self._factory_evm, "data": "0x" + sel_mf.hex()}, "latest"])
-                tinycent = int(abi_decode(["uint256"], bytes.fromhex(res_mf[2:]))[0])
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug("get_mint_fee: factory.mintFee tinycent=%s", tinycent)
-            except Exception:
-                tinycent = None
-
-        # Fallback interno: MasterChef.depositFee() -> tinycent
-        if tinycent is None and self._master_chef_addr:
-            sel_df = eth_utils.keccak(text="depositFee()")[:4]
-            res_df = self._call_rpc("eth_call", [{"to": self._master_chef_addr, "data": "0x" + sel_df.hex()}, "latest"])
-            tinycent = int(abi_decode(["uint256"], bytes.fromhex(res_df[2:]))[0])
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug("get_mint_fee: masterChef.depositFee tinycent=%s", tinycent)
-
-        if tinycent is None:
-            raise RuntimeError("tinycent no disponible (mintFee/depositFee)")
+        sel_df = eth_utils.keccak(text="depositFee()")[:4]
+        res_df = self._call_rpc("eth_call", [{"to": self._master_chef_addr, "data": "0x" + sel_df.hex()}, "latest"])
+        tinycent = int(abi_decode(["uint256"], bytes.fromhex(res_df[2:]))[0])
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("get_mint_fee: masterChef.depositFee tinycent=%s", tinycent)
 
         # 2) tinycent -> tinybars vía MasterChef.tinycentsToTinybars(uint256)
         if not self._master_chef_addr:
@@ -1388,14 +1371,21 @@ class SaucerSwapAdapter:
         except Exception as exc:
             notes.append(f"balance check error: {exc}")
 
-        # msg.value: cubrir mintFee + (opcional) déficit de WHBAR para igualar el flujo de la UI
+        # msg.value: cubrir únicamente mintFee (alineado a UI). No enviar déficit WHBAR
         value_hex = None
         try:
             whbar_hts = getattr(self, "_whbar_token_id", lambda: None)()
+            if not whbar_hts:
+                # Fallback robusto: resolver WHBAR vía helper.whbarToken() -> EVM -> HTS
+                try:
+                    whbar_evm = self._whbar_helper_token_address()
+                    if whbar_evm:
+                        whbar_hts = self._evm_to_hts(whbar_evm)
+                except Exception:
+                    pass
         except Exception:
             whbar_hts = None
         try:
-            hbar_deficit_raw = 0
             fee_wei_val = 0
             try:
                 mf = self.get_mint_fee()
@@ -1403,22 +1393,62 @@ class SaucerSwapAdapter:
                     fee_wei_val = int(mf["wei"])  # tinybars->wei ya convertido en get_mint_fee
             except Exception:
                 fee_wei_val = 0
-            if isinstance(whbar_hts, str):
-                # Si el token WHBAR está en token0 o token1, usar los déficits calculados
-                if token0_hts == whbar_hts and deficit0_raw > 0:
-                    hbar_deficit_raw = deficit0_raw
-                elif token1_hts == whbar_hts and deficit1_raw > 0:
-                    hbar_deficit_raw = deficit1_raw
-            # convertir tinybars (raw de WHBAR) a wei: 1 tinybar = 10^10 wei
-            deficit_wei = int(hbar_deficit_raw) * (10 ** 10)
-            # Nuevo comportamiento: solo cubrir mintFee + déficit de WHBAR, sin enviar el bruto deseado
-            total_wei = fee_wei_val + deficit_wei
+            # Solo mintFee; no añadir déficit WHBAR al value
+            total_wei = fee_wei_val
             if total_wei > 0:
                 value_hex = hex(total_wei)
                 tx["value"] = value_hex
-                notes.append(f"msg.value = mintFee({fee_wei_val}) + deficitWHBAR_raw({hbar_deficit_raw})")
+                notes.append(f"msg.value = mintFee({fee_wei_val})")
         except Exception as _vx:
             notes.append(f"value calc warn: {_vx}")
+
+        # Auto-wrap HBAR->WHBAR previo al mint si hay déficit WHBAR y saldo HBAR suficiente
+        try:
+            auto_wrap_added = False
+            helper_addr = self._get_whbar_helper_address()
+            # Resolver WHBAR EVM para detección robusta
+            whbar_evm_detect = self._get_whbar_evm_from_router() or self._whbar_helper_token_address()
+            if helper_addr and helper_addr.startswith("0x"):
+                # Detectar déficit WHBAR por HTS o por EVM address
+                deficit_wh = 0
+                match_side = None
+                if isinstance(whbar_hts, str) and whbar_hts:
+                    if token0_hts == whbar_hts and deficit0_raw > 0:
+                        deficit_wh = int(deficit0_raw); match_side = "A"
+                    elif token1_hts == whbar_hts and deficit1_raw > 0:
+                        deficit_wh = int(deficit1_raw); match_side = "B"
+                if deficit_wh == 0 and isinstance(whbar_evm_detect, str) and whbar_evm_detect.startswith("0x"):
+                    if useA_evm.lower() == whbar_evm_detect.lower() and deficit0_raw > 0:
+                        deficit_wh = int(deficit0_raw); match_side = "A"
+                    elif useB_evm.lower() == whbar_evm_detect.lower() and deficit1_raw > 0:
+                        deficit_wh = int(deficit1_raw); match_side = "B"
+                if deficit_wh > 0:
+                    # Consultar saldo HBAR (tinybars)
+                    try:
+                        ws = self.wallet_state() or {}
+                        hbar_tb = int(((ws.get("native") or {}).get("HBAR", 0)))
+                    except Exception:
+                        hbar_tb = 0
+                    if hbar_tb >= deficit_wh:
+                        # Construir tx de wrap: WhbarHelper.deposit() payable con value=deficit_wh * 1e10 wei
+                        import eth_utils  # type: ignore
+                        sel_deposit = eth_utils.keccak(text="deposit()")[:4]
+                        wrap_value_wei = int(deficit_wh) * (10 ** 10)
+                        approve_steps.append({
+                            "from": self.evm_address,
+                            "to": helper_addr,
+                            "data": "0x" + sel_deposit.hex(),
+                            "value": hex(wrap_value_wei),
+                            "kind": "wrap_whbar",
+                        })
+                        auto_wrap_added = True
+                        notes.append(f"auto-wrap WHBAR: side={match_side} deposit tinybars={deficit_wh}")
+                        # Si añadimos wrap, permitimos el envío del mint
+                        can_send = True
+                    else:
+                        notes.append(f"auto-wrap skipped: hbar_tb={hbar_tb} < deficit_wh={deficit_wh}")
+        except Exception as _awx:
+            notes.append(f"auto-wrap warn: {_awx}")
 
         # Guard de desviación: abortar si el tick actual se alejó demasiado del plan
         try:
@@ -1435,16 +1465,10 @@ class SaucerSwapAdapter:
         except Exception:
             pass
 
-        # Determinar canSend considerando cobertura con msg.value del lado WHBAR
+        # Determinar canSend: bloquear si hay déficit de cualquier token (a menos que auto-wrap esté preparado)
         try:
             can_send = True
-            # Déficit en lado no-WHBAR bloquea el envío
-            if (token0_hts != whbar_hts and deficit0_raw > 0) or (token1_hts != whbar_hts and deficit1_raw > 0):
-                can_send = False
-            # Para el lado WHBAR, permitir si el déficit está cubierto por msg.value
-            if token0_hts == whbar_hts and deficit0_raw > 0 and hbar_deficit_raw < deficit0_raw:
-                can_send = False
-            if token1_hts == whbar_hts and deficit1_raw > 0 and hbar_deficit_raw < deficit1_raw:
+            if (deficit0_raw > 0 or deficit1_raw > 0) and not locals().get("auto_wrap_added", False):
                 can_send = False
         except Exception:
             # Mantener valor anterior en caso de error
@@ -1492,8 +1516,41 @@ class SaucerSwapAdapter:
                 "to": ap.get("to"),
                 "data": ap.get("data"),
             }
+            if ap.get("value"):
+                txa["value"] = ap["value"]
             res_a = self.send_transaction(txa, wait=wait)
             results["steps"].append({"approve": res_a})
+
+        # Si hubo intento de wrap y falló, no continuar con el mint
+        try:
+            helper_addr = self._get_whbar_helper_address()
+            wrap_failed = False
+            for step in results["steps"]:
+                apr = step.get("approve") or {}
+                to_addr = ((apr.get("tx") or {}).get("to") or "").lower()
+                if helper_addr and to_addr == helper_addr.lower():
+                    rec = apr.get("receipt") or {}
+                    status_hex = str(rec.get("status") or "0x1")
+                    if status_hex != "0x1":
+                        wrap_failed = True
+                        break
+            if wrap_failed:
+                results["steps"].append({"skipped_mint": {"error": "wrap_failed"}})
+                return results
+        except Exception:
+            pass
+
+        # Respetar canSend: si es False, no intentar el mint
+        try:
+            if not bool(prep.get("canSend", True)):
+                reason = {
+                    "error": "canSend=false",
+                    "notes": prep.get("notes"),
+                }
+                results["steps"].append({"skipped_mint": reason})
+                return results
+        except Exception:
+            pass
 
         # 2) Enviar mint (multicall) por JSON-RPC
         gas_limit = int(prep.get("gasEstimate") or 1375000)
@@ -1511,24 +1568,6 @@ class SaucerSwapAdapter:
             rec = (res_m or {}).get("receipt")
             if rec and isinstance(rec, dict):
                 self._log_remove_receipt(rec)
-        except Exception:
-            pass
-
-        # 3) Fallback: intentar mint directo si multicall revirtió
-        try:
-            rec_m = res_m.get("receipt") or {}
-            status_hex = str(rec_m.get("status", "")).lower()
-            if status_hex in ("0x0", "0"):
-                txd = {
-                    "from": txm.get("from", self.evm_address),
-                    "to": txm.get("to"),
-                    "data": prep.get("mintData") or data_hex,
-                    "gas": gas_limit,
-                }
-                if txm.get("value"):
-                    txd["value"] = txm["value"]
-                res_d = self.send_transaction(txd, wait=wait)
-                results["fallback_mint"] = res_d
         except Exception:
             pass
 
@@ -1849,20 +1888,64 @@ class SaucerSwapAdapter:
             tick_spacing = 1
         t0 = (info.get("token0") or {}) if isinstance(info, dict) else {}
         t1 = (info.get("token1") or {}) if isinstance(info, dict) else {}
-        id0 = t0.get("id")
-        id1 = t1.get("id")
+        raw_id0 = t0.get("id") or t0.get("tokenId")
+        raw_id1 = t1.get("id") or t1.get("tokenId")
         evm0 = t0.get("evm") or t0.get("tokenEvm")
         evm1 = t1.get("evm") or t1.get("tokenEvm")
-        # Forzar orden de tokens del mint a token0/token1 del pool
-        if mintA not in (id0, id1) or mintB not in (id0, id1):
-            # fallback: mantener los mints tal cual si no coinciden
-            tokenA = mintA
-            tokenB = mintB
-            use_evmA, use_evmB = self._hts_to_evm(tokenA), self._hts_to_evm(tokenB)
-        else:
+        # Normalizar a HTS para comparar de forma estable
+        def norm_hts(x: Optional[str]) -> str:
+            try:
+                if not isinstance(x, str):
+                    return ""
+                if x.upper() == "HBAR":
+                    return self._whbar_token_id() or ""
+                if x.count(".") == 2:
+                    return x
+                if x.startswith("0x"):
+                    return self._evm_to_hts(x) or ""
+                return x
+            except Exception:
+                return ""
+        # Preferir derivación on-chain desde el contrato de pool (token0()/token1())
+        id0 = None
+        id1 = None
+        try:
+            pool_contract_id = (info.get("contractId") or info.get("contract_id") or "") if isinstance(info, dict) else ""
+            pool_evm = self._hts_to_evm(pool_contract_id) if pool_contract_id else ""
+            if isinstance(pool_evm, str) and pool_evm.startswith("0x"):
+                import eth_utils  # type: ignore
+                from eth_abi import decode as abi_decode  # type: ignore
+                sel_t0 = eth_utils.keccak(text="token0()")[:4]
+                sel_t1 = eth_utils.keccak(text="token1()")[:4]
+                r0 = self._call_rpc("eth_call", [{"to": pool_evm, "data": "0x" + sel_t0.hex()}, "latest"]) or "0x"
+                r1 = self._call_rpc("eth_call", [{"to": pool_evm, "data": "0x" + sel_t1.hex()}, "latest"]) or "0x"
+                addr0 = abi_decode(["address"], bytes.fromhex(r0[2:]))[0]
+                addr1 = abi_decode(["address"], bytes.fromhex(r1[2:]))[0]
+                id0 = self._evm_to_hts(addr0) or ""
+                id1 = self._evm_to_hts(addr1) or ""
+        except Exception:
+            id0 = None
+            id1 = None
+        # Si falló on-chain, caer al info normalizado
+        if not id0 or not id1:
+            id0 = norm_hts(raw_id0) or norm_hts(evm0)
+            id1 = norm_hts(raw_id1) or norm_hts(evm1)
+        mintA_hts = norm_hts(mintA)
+        mintB_hts = norm_hts(mintB)
+        # Alinear estrictamente al orden token0/token1 de la pool.
+        # Si el caller los pasó invertidos, reordenamos y marcaremos swap de amounts.
+        swap_amounts = False
+        if mintA_hts == id0 and mintB_hts == id1:
             tokenA = id0
             tokenB = id1
             use_evmA, use_evmB = evm0, evm1
+        elif mintA_hts == id1 and mintB_hts == id0:
+            tokenA = id0
+            tokenB = id1
+            use_evmA, use_evmB = evm0, evm1
+            swap_amounts = True
+        else:
+            raise RuntimeError("mints no coinciden con token0/token1 de la pool")
 
         # Alinear ticks al tickSpacing del pool y asegurar rango válido
         try:
@@ -1896,6 +1979,8 @@ class SaucerSwapAdapter:
         # Si se pasan amounts deseados, respetarlos; si no, defaults a 0
         amount0_desired = int(amount0_desired or 0)
         amount1_desired = int(amount1_desired or 0)
+        if swap_amounts:
+            amount0_desired, amount1_desired = amount1_desired, amount0_desired
 
         # Usar slippage de entrada; los mínimos se fuerzan a 0 en mint
         eff_slippage_bps = int(slippage_bps or 0)
@@ -2203,21 +2288,8 @@ class SaucerSwapAdapter:
                         except Exception as exc:
                             notes.append(f"approve HTS error: {exc}")
                             did_approve = False
-                    # Si HTS no fue posible, fallback a approve ERC20 on-chain
                     if not did_approve:
-                        try:
-                            from eth_abi import encode as abi_encode  # type: ignore
-                            import eth_utils  # type: ignore
-                            token_evm = token_in_raw if (isinstance(token_in_raw, str) and token_in_raw.startswith("0x")) else (self._hts_to_evm(token_in_raw) or "")
-                            if not token_evm or not token_evm.startswith("0x"):
-                                raise RuntimeError("no se pudo derivar token ERC20 EVM para approve")
-                            approve_sel = eth_utils.keccak(text="approve(address,uint256)")[:4]
-                            calldata = approve_sel + abi_encode(["address", "uint256"], [router, int(needed)])
-                            txa = {"from": self.evm_address, "to": token_evm, "data": "0x" + calldata.hex()}
-                            res_erc = self.send_transaction(txa, wait=True)
-                            notes.append(f"approve ERC20 ejecutado: {res_erc}")
-                        except Exception as exc2:
-                            notes.append(f"approve ERC20 error: {exc2}")
+                        raise RuntimeError("approve HTS no ejecutado; abortando swap")
                     # Poll corto para ver el nuevo allowance tras cualquiera de las vías
                     try:
                         import time
@@ -2393,13 +2465,8 @@ class SaucerSwapAdapter:
 
         # Si falta gas, intenta estimar
         if "gas" not in tx_to_sign:
-            try:
-                est = self._call_rpc("eth_estimateGas", [{"from": address_from, "to": tx["to"], "data": tx_to_sign["data"], "value": hex(tx_to_sign.get("value", 0)) if tx_to_sign.get("value") else "0x0"}, "latest"])
-                tx_to_sign["gas"] = int(est, 16) if isinstance(est, str) else est
-            except Exception as exc:
-                tx_to_sign["gas"] = 300000
-                if self.logger.isEnabledFor(logging.WARNING):
-                    self.logger.warning("send_tx: fallback gas=300000 (estimate failed: %s)", exc)
+            est = self._call_rpc("eth_estimateGas", [{"from": address_from, "to": tx["to"], "data": tx_to_sign["data"], "value": hex(tx_to_sign.get("value", 0)) if tx_to_sign.get("value") else "0x0"}, "latest"])
+            tx_to_sign["gas"] = int(est, 16) if isinstance(est, str) else est
 
         # Firmar y enviar
         acct = Account.from_key(bytes.fromhex(self._private_key_hex))
