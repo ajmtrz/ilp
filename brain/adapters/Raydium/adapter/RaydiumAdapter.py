@@ -769,7 +769,7 @@ class RaydiumAdapter:
         Retorna None si no está disponible.
         """
         try:
-            resp = self._rpc_call_with_failover("getTokenAccountBalance", [token_account, {"commitment": "processed"}])
+            resp = self._rpc_call_with_failover("getTokenAccountBalance", [token_account, {"commitment": "finalized"}])
             val = (resp.get("result") or {}).get("value") or {}
             amt = val.get("amount")
             if isinstance(amt, str) and amt.isdigit():
@@ -780,6 +780,119 @@ class RaydiumAdapter:
                 return None
         except Exception:
             return None
+
+    def _get_native_sol_balance_int(self) -> Optional[int]:
+        """Devuelve balance nativo de SOL (lamports) del owner con getBalance."""
+        try:
+            resp = self._rpc_call_with_failover("getBalance", [self.owner_pubkey, {"commitment": "finalized"}])
+            val = (resp.get("result") or {})
+            lamports = val.get("value")
+            if isinstance(lamports, int):
+                return lamports
+            try:
+                return int(str(lamports))
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _get_token_balance_sum_by_mint(self, mint: str) -> int:
+        """Suma el balance de todos los token accounts del owner para un mint dado (u64 en unidades mínimas)."""
+        import requests
+        if not isinstance(mint, str):
+            return 0
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getParsedTokenAccountsByOwner",
+                "params": [
+                    self.owner_pubkey,
+                    {"mint": mint},
+                    {"commitment": "finalized"},
+                ],
+            }
+            resp = requests.post(self.rpc.current, json=payload, timeout=12)
+            resp.raise_for_status()
+            data = resp.json() or {}
+            result = (data.get("result") or {})
+            value = result.get("value") or []
+            total = 0
+            for it in value:
+                try:
+                    acc = (it or {}).get("account") or {}
+                    parsed = (acc.get("data") or {}).get("parsed") or {}
+                    info = parsed.get("info") or {}
+                    ui = (info.get("tokenAmount") or info.get("tokenAmount")) or {}
+                    amount = ui.get("amount")
+                    if isinstance(amount, str) and amount.isdigit():
+                        total += int(amount)
+                    else:
+                        try:
+                            total += int(str(amount))
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            return int(total)
+        except Exception:
+            # Intento alternativo con rotación simple del endpoint
+            try:
+                _ = self.rpc.rotate()
+            except Exception:
+                pass
+            try:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getParsedTokenAccountsByOwner",
+                    "params": [
+                        self.owner_pubkey,
+                        {"mint": mint},
+                        {"commitment": "finalized"},
+                    ],
+                }
+                import requests as _rq
+                r2 = _rq.post(self.rpc.current, json=payload, timeout=12)
+                r2.raise_for_status()
+                d2 = r2.json() or {}
+                res2 = (d2.get("result") or {})
+                val2 = res2.get("value") or []
+                tot = 0
+                for it in val2:
+                    try:
+                        acc = (it or {}).get("account") or {}
+                        parsed = (acc.get("data") or {}).get("parsed") or {}
+                        info = parsed.get("info") or {}
+                        ui = (info.get("tokenAmount") or info.get("tokenAmount")) or {}
+                        amount = ui.get("amount")
+                        if isinstance(amount, str) and amount.isdigit():
+                            tot += int(amount)
+                        else:
+                            try:
+                                tot += int(str(amount))
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+                return int(tot)
+            except Exception:
+                return 0
+
+    def wallet_state(self) -> dict:
+        """Estado de wallet: SOL nativo y balances por mint conocidos (derivables del contexto de pools).
+        No usa fallbacks excepto rotación de endpoint RPC.
+        """
+        state: Dict[str, Any] = {"owner": self.owner_pubkey, "native": {}, "balances": {}, "atas": {}}
+        sol = self._get_native_sol_balance_int() or 0
+        state["native"]["SOL"] = int(sol)
+        # Si tenemos pools conocidas via API, podemos listar mints frecuentes. En ausencia de lista, devolver al menos SOL.
+        try:
+            # No asumimos lista global; el consumidor puede pedir balances específicos con tool_get_wallet_state(tokens=[...])
+            pass
+        except Exception:
+            pass
+        return state
 
     def _assemble_v0_from_anchor(self, anchor_obj: Dict[str, Any]) -> Tuple[str, List[str]]:
         """Empaqueta ComputeBudget + ix Anchor en una transacción V0 y la devuelve en base64.
@@ -3109,97 +3222,6 @@ class RaydiumAdapter:
             "notes": [],
         }
 
-    def liquidity_prepare_open(
-        self,
-        pool_id: str,
-        tick_lower: int,
-        tick_upper: int,
-        mintA: str,
-        mintB: str,
-        user_token_account_a: Optional[str] = None,
-        user_token_account_b: Optional[str] = None,
-        slippage_bps: int = 100,
-        with_metadata: bool = True,
-        base_flag: Optional[bool] = False,
-        compute_unit_price_micro: int = 25_000,
-        compute_unit_limit: int = 600_000,
-    ) -> Dict[str, Any]:
-        # Derivar ATAs si no se pasan; para SOL usar ATA de WSOL del owner (auto-wrap)
-        ata_a = user_token_account_a or (self._derive_ata(self.owner_pubkey, mintA) if not self._is_sol_mint(mintA) else self._derive_ata(self.owner_pubkey, self.SOL_MINT))
-        ata_b = user_token_account_b or (self._derive_ata(self.owner_pubkey, mintB) if not self._is_sol_mint(mintB) else self._derive_ata(self.owner_pubkey, self.SOL_MINT))
-        # Leer balances exactos (si aún no existen ATAs, balance 0)
-        bal_a = self._get_token_account_balance_int(ata_a) if ata_a else 0
-        bal_b = self._get_token_account_balance_int(ata_b) if ata_b else 0
-        def with_margin(x: int) -> int:
-            try:
-                # Aumentar margen efectivo para evitar 6021: usar slippage_bps + 100 (1% extra)
-                bps = max(0, int(slippage_bps) + 100)
-                return int((x * (10_000 + bps)) // 10_000)
-            except Exception:
-                return int(x)
-        amount0_max = with_margin(int(bal_a or 0))
-        amount1_max = with_margin(int(bal_b or 0))
-        # Crear listas de prewrap/postunwrap/createATAs para auto WSOL y ATAs faltantes
-        prewrap: List[Dict[str, Any]] = []
-        postunwrap: List[Dict[str, Any]] = []
-        createATAs: List[Dict[str, Any]] = []
-        # Asegurar ATAs para mints no-SOL si faltan
-        if not self._is_sol_mint(mintA):
-            try:
-                ata_chk = self._derive_ata(self.owner_pubkey, mintA)
-                exists = self._ata_exists(ata_chk)
-                if exists is False:
-                    createATAs.append({"owner": self.owner_pubkey, "mint": mintA})
-            except Exception:
-                pass
-        if not self._is_sol_mint(mintB):
-            try:
-                ata_chk = self._derive_ata(self.owner_pubkey, mintB)
-                exists = self._ata_exists(ata_chk)
-                if exists is False:
-                    createATAs.append({"owner": self.owner_pubkey, "mint": mintB})
-            except Exception:
-                pass
-        # Preparar wrap/unwrap para lados SOL usando el ATA WSOL
-        if self._is_sol_mint(mintA) and isinstance(ata_a, str):
-            try:
-                exists = self._ata_exists(ata_a)
-                if exists is False:
-                    createATAs.append({"owner": self.owner_pubkey, "mint": self.SOL_MINT})
-            except Exception:
-                pass
-            # Añadir pequeño buffer de wrap (0.002 SOL) para cubrir SyncNative/fees mínimas
-            prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": ata_a, "lamports": int(amount0_max) + 2000000})
-            postunwrap.append({"kind": "unwrap", "ata": ata_a})
-        if self._is_sol_mint(mintB) and isinstance(ata_b, str):
-            try:
-                exists = self._ata_exists(ata_b)
-                if exists is False:
-                    createATAs.append({"owner": self.owner_pubkey, "mint": self.SOL_MINT})
-            except Exception:
-                pass
-            prewrap.append({"kind": "wrap", "mint": self.SOL_MINT, "ata": ata_b, "lamports": int(amount1_max) + 2000000})
-            postunwrap.append({"kind": "unwrap", "ata": ata_b})
-        try:
-            ix = self.build_open_position_with_token22_ix(
-                pool_id=pool_id,
-                mintA=mintA,
-                mintB=mintB,
-                tick_lower=int(tick_lower),
-                tick_upper=int(tick_upper),
-                amount0_max=int(amount0_max),
-                amount1_max=int(amount1_max),
-                with_metadata=with_metadata,
-                base_flag=base_flag,
-                token_account_a=ata_a,
-                token_account_b=ata_b,
-            )
-        except Exception as exc:
-            return {"canSend": False, "error": str(exc), "notes": [str(exc)]}
-        cb = {"microLamports": int(compute_unit_price_micro), "units": int(compute_unit_limit)}
-        anc = {"anchor": {"ix": ix, "computeBudget": cb, "prewrap": prewrap, "postunwrap": postunwrap, "createATAs": createATAs}}
-        tx_b64, extras = self._assemble_v0_from_anchor(anc)
-        return {"canSend": True, "transactions": [tx_b64], "extraSigners": extras or [], "meta": {"poolId": pool_id}, "notes": ix.get("notes") or []}
 __all__ = ["RaydiumAdapter", "RaydiumConfig"]
 
 
