@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 import yaml
-from brain.adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
+from adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
 
 
 @dataclass
@@ -517,7 +517,7 @@ class SaucerSwapAdapter:
         import requests
         result: Dict[str, Any] = {"balances": {}}
         base = "https://mainnet.mirrornode.hedera.com/api/v1"
-        # Cuenta
+        # Cuenta (HBAR)
         r = requests.get(f"{base}/accounts/{self.account_id}", timeout=15)
         r.raise_for_status()
         acc = r.json() or {}
@@ -527,24 +527,65 @@ class SaucerSwapAdapter:
             result.setdefault("native", {})["HBAR"] = hbar_tb
         except Exception:
             pass
-        # Tokens
-        tokens_list = (acc.get("tokens") or [])
+        # Tokens: usar endpoint dedicado con paginación, y fallback a campo embebido en /accounts
         dec_cache: Dict[str, Any] = {}
-        for t in tokens_list[:200]:
-            tid = t.get("token_id")
-            bal = int(t.get("balance", 0))
-            result["balances"].setdefault(tid, {"raw": 0})
-            result["balances"][tid]["raw"] = int(result["balances"][tid]["raw"]) + bal
-            if tid and tid not in dec_cache:
-                try:
-                    tr = requests.get(f"{base}/tokens/{tid}", timeout=10)
-                    if tr.ok:
-                        tj = tr.json() or {}
-                        dec_cache[tid] = {"decimals": tj.get("decimals"), "symbol": tj.get("symbol")}
-                except Exception:
-                    dec_cache[tid] = {}
-        for tid, meta in dec_cache.items():
-            result["balances"].setdefault(tid, {"raw": 0}).update({k: v for k, v in meta.items() if v is not None})
+        try:
+            next_url = f"{base}/accounts/{self.account_id}/tokens?limit=100"
+            while next_url:
+                tr = requests.get(next_url, timeout=20)
+                tr.raise_for_status()
+                tj = tr.json() or {}
+                items = (tj.get("tokens") or [])
+                for t in items:
+                    tid = t.get("token_id")
+                    bal = int(t.get("balance", 0))
+                    result["balances"].setdefault(tid, {"raw": 0})
+                    result["balances"][tid]["raw"] = int(result["balances"][tid]["raw"]) + bal
+                    # si el endpoint devuelve decimals/symbol, conservarlos
+                    if "decimals" in t:
+                        result["balances"][tid]["decimals"] = t.get("decimals")
+                    if "symbol" in t:
+                        result["balances"][tid]["symbol"] = t.get("symbol")
+                    if tid and tid not in dec_cache:
+                        dec_cache[tid] = None  # marcar para metadata
+                # paginación
+                links = tj.get("links") or {}
+                next_url = links.get("next")
+                if isinstance(next_url, str) and next_url and not next_url.startswith("http"):
+                    next_url = f"{base}{next_url}"
+        except Exception:
+            # Fallback: tokens embebidos en /accounts
+            tokens_list = (acc.get("tokens") or [])
+            for t in tokens_list:
+                tid = t.get("token_id")
+                bal = int(t.get("balance", 0))
+                result["balances"].setdefault(tid, {"raw": 0})
+                result["balances"][tid]["raw"] = int(result["balances"][tid]["raw"]) + bal
+                if tid and tid not in dec_cache:
+                    dec_cache[tid] = None
+
+        # Completar metadata básica de tokens pendientes
+        for tid in list(result["balances"].keys()):
+            meta = result["balances"].get(tid) or {}
+            if meta.get("decimals") is not None and meta.get("symbol") is not None:
+                continue
+            try:
+                tr = requests.get(f"{base}/tokens/{tid}", timeout=10)
+                if tr.ok:
+                    tj = tr.json() or {}
+                    if meta.get("decimals") is None:
+                        meta["decimals"] = tj.get("decimals")
+                    if meta.get("symbol") is None:
+                        meta["symbol"] = tj.get("symbol")
+                    result["balances"][tid] = meta
+            except Exception:
+                continue
+        # Filtrar balances en cero
+        try:
+            bals = result.get("balances") or {}
+            result["balances"] = {tid: info for tid, info in bals.items() if int((info or {}).get("raw", 0)) > 0}
+        except Exception:
+            pass
         return result
 
     def _whbar_sweep_unwrap(self, owner: str) -> Optional[Dict[str, Any]]:
@@ -1699,7 +1740,9 @@ class SaucerSwapAdapter:
         }
 
     def liquidity_decrease_send(self, prep: Dict[str, Any], wait: bool = True) -> Dict[str, Any]:
-        """Envía la transacción de remove (multicall) por JSON-RPC. Devuelve receipt y cantidades si están en logs."""
+        """Envía la transacción de remove (multicall) por JSON-RPC. Devuelve receipt y cantidades si están en logs.
+        Tras el envío, ejecuta siempre un unwrap de WHBAR residual mediante WhbarHelper (en tx separada).
+        """
         results: Dict[str, Any] = {"steps": []}
         if not prep or not isinstance(prep.get("to"), str) or not isinstance(prep.get("data"), str):
             return {"error": "prep inválido"}
@@ -1719,6 +1762,14 @@ class SaucerSwapAdapter:
                 self._log_remove_receipt(rec)
         except Exception:
             pass
+        # Auto-sweep obligatorio de WHBAR -> HBAR mediante helper dedicado
+        try:
+            owner = tx.get("from") or self.evm_address
+            sweep = self._whbar_sweep_unwrap(owner)
+            if sweep and (sweep.get("executed") or sweep.get("skipped") or sweep.get("error")):
+                results["steps"].append({"whbar_sweep": sweep})
+        except Exception as exc:
+            results["steps"].append({"whbar_sweep": {"error": str(exc)}})
         return results
 
     def _log_remove_receipt(self, receipt: Dict[str, Any]) -> None:

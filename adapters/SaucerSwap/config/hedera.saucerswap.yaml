@@ -1,0 +1,29 @@
+# Hedera + SaucerSwap configuration
+hedera:
+  network: mainnet
+  json_rpc_endpoints:
+    - https://mainnet.hashio.io/api
+  wallet:
+    private_key_path: ~/.secure/hedera/id.json
+saucerswap:
+  api_base: https://api.saucerswap.finance
+  contracts:
+    quoter_v2: 0.0.3949424
+    swap_router: 0.0.3949434
+    whbar_helper: 0.0.5808826
+    nonfungible_position_manager: 0.0.4053945
+    lp_nft_id: 0.0.4054027
+    factory_v2: 0.0.3946833
+    tick_lens: 0.0.3948950
+    hbar_conversion: 0.0.3946810
+    master_chef: 0.0.1077627
+  abi_files:
+    quoter_v2: adapters/SaucerSwap/config/abi/QuoterV2.json
+    swap_router: adapters/SaucerSwap/config/abi/SwapRouter.json
+    whbar_helper: adapters/SaucerSwap/config/abi/WhbarHelper.json
+    nonfungible_position_manager: adapters/SaucerSwap/config/abi/NonfungiblePositionManager.json
+    factory_v2: adapters/SaucerSwap/config/abi/UniswapV3Factory.json
+    pool: adapters/SaucerSwap/config/abi/UniswapV3Pool.json
+    tick_lens: adapters/SaucerSwap/config/abi/TickLens.json
+    hbar_conversion: adapters/SaucerSwap/config/abi/HbarConversion.json
+    master_chef: adapters/SaucerSwap/config/abi/MasterChef.json

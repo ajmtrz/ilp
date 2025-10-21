@@ -13,8 +13,8 @@ class AdapterFactory:
     def get(self, protocol: str) -> Any:
         p = (protocol or "").lower()
         if p == "raydium":
-            return RaydiumAdapter(config_path=f"{self.project_root}/brain/adapters/Raydium/config/solana.raydium.yaml")
+            return RaydiumAdapter(config_path=f"{self.project_root}/adapters/Raydium/config/solana.raydium.yaml")
         if p == "saucerswap":
             # Hedera config file path
-            return SaucerSwapAdapter(config_path=f"{self.project_root}/brain/adapters/SaucerSwap/config/hedera.saucerswap.yaml")
+            return SaucerSwapAdapter(config_path=f"{self.project_root}/adapters/SaucerSwap/config/hedera.saucerswap.yaml")
         raise ValueError(f"Protocolo no soportado: {protocol}")

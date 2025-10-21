@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import yaml
-from brain.adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
+from adapters.common.config import get_project_root, load_project_env, configure_logging, resolve_from_root
 
 from .ClmmDecoder import ClmmDecoder
 
@@ -886,12 +886,70 @@ class RaydiumAdapter:
         state: Dict[str, Any] = {"owner": self.owner_pubkey, "native": {}, "balances": {}, "atas": {}}
         sol = self._get_native_sol_balance_int() or 0
         state["native"]["SOL"] = int(sol)
-        # Si tenemos pools conocidas via API, podemos listar mints frecuentes. En ausencia de lista, devolver al menos SOL.
+
+        def _collect_by_program(program_id: str) -> None:
+            try:
+                # Usar getTokenAccountsByOwner con encoding jsonParsed para máxima compatibilidad
+                resp = self._rpc_call_with_failover(
+                    "getTokenAccountsByOwner",
+                    [
+                        self.owner_pubkey,
+                        {"programId": program_id},
+                        {"commitment": "finalized", "encoding": "jsonParsed"},
+                    ],
+                )
+                value = ((resp or {}).get("result") or {}).get("value") or []
+                for it in value:
+                    try:
+                        pubkey = it.get("pubkey")
+                        acc = (it.get("account") or {})
+                        parsed = ((acc.get("data") or {}).get("parsed") or {})
+                        info = parsed.get("info") or {}
+                        mint = info.get("mint")
+                        ta = info.get("tokenAmount") or {}
+                        amount = ta.get("amount")
+                        decimals = ta.get("decimals")
+                        ui = ta.get("uiAmountString")
+                        if not isinstance(mint, str):
+                            continue
+                        # ATAs por mint
+                        state["atas"].setdefault(mint, [])
+                        if isinstance(pubkey, str):
+                            state["atas"][mint].append(pubkey)
+                        # Acumulado de amount entero
+                        try:
+                            amt_i = int(amount) if isinstance(amount, str) else int(str(amount))
+                        except Exception:
+                            continue
+                        entry = state["balances"].setdefault(mint, {"amount": 0, "decimals": decimals, "ui": ui})
+                        entry["amount"] = int(entry.get("amount", 0)) + int(amt_i)
+                        # Mantener el mayor "decimals" conocido y una ui representativa si no existe
+                        if isinstance(decimals, int):
+                            prev_dec = entry.get("decimals")
+                            if not isinstance(prev_dec, int):
+                                entry["decimals"] = decimals
+                        if ui and not entry.get("ui"):
+                            entry["ui"] = ui
+                    except Exception:
+                        continue
+            except Exception:
+                return
+
+        # Token Program (SPL) y Token-2022
+        _collect_by_program("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        _collect_by_program("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+
+        # Filtrar balances en cero y sincronizar ATAs
         try:
-            # No asumimos lista global; el consumidor puede pedir balances específicos con tool_get_wallet_state(tokens=[...])
-            pass
+            balances = state.get("balances") or {}
+            filtered = {mint: info for mint, info in balances.items() if int((info or {}).get("amount", 0)) > 0}
+            state["balances"] = filtered
+            atas = state.get("atas") or {}
+            if isinstance(atas, dict):
+                state["atas"] = {mint: atas.get(mint, []) for mint in filtered.keys()}
         except Exception:
             pass
+
         return state
 
     def _assemble_v0_from_anchor(self, anchor_obj: Dict[str, Any]) -> Tuple[str, List[str]]:
