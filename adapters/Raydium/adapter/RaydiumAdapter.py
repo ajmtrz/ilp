@@ -3001,8 +3001,7 @@ class RaydiumAdapter:
                     continue
         if current_tick is None:
             self.logger.warning("tickCurrent no disponible en cuenta de pool %s", pool_id)
-        else:
-            self.logger.info("tickCurrent(pool %s)=%s", pool_id, current_tick)
+            
         return current_tick
 
 
@@ -3023,23 +3022,35 @@ class RaydiumAdapter:
         details["pda"] = pda
         return details
 
-    def position_belongs_to_pool(self, position: str, pool_id: str) -> Dict[str, Any]:
-        """Lee la posición por NFT y determina si pertenece a la pool indicada, devolviendo ticks y liquidez."""
-        if not position or not pool_id:
-            return {"ok": False, "error": "missing position or pool_id"}
+    def position_belongs_to_pool(self, position: str, pool_id: Optional[str] = None) -> Dict[str, Any]:
+        """Lee la posición por NFT y determina su estado; si no se pasa pool_id, lo resuelve desde la posición."""
+        if not position:
+            return {"ok": False, "error": "missing position"}
         pos = self._read_position_core(position)
         if not pos:
             return {"ok": False, "error": "position not found"}
+        # Resolver pool_id desde la posición si no se proporcionó
+        resolved_pool_id: Optional[str] = pool_id
+        if not resolved_pool_id:
+            for k in ("pool", "pool_id", "poolState", "pool_state", "poolId", "poolKey", "poolAddress"):
+                if k in pos:
+                    try:
+                        v = pos[k]
+                        if isinstance(v, str) and len(v) > 0:
+                            resolved_pool_id = v
+                            break
+                    except Exception:
+                        continue
+        if not resolved_pool_id:
+            return {"ok": False, "error": "pool_id could not be resolved from position"}
         lower, upper = self._extract_ticks_from_position(pos)
         liq = self._extract_liquidity_from_position(pos)
-        # Verificar protocol position PDA con los ticks detectados
+        # Verificar protocol position PDA con los ticks detectados (opcional)
         try:
-            if lower is not None and upper is not None:
-                proto_pos, _ = self.derive_protocol_position_pda(pool_id, int(lower), int(upper))
-            else:
-                proto_pos = None
+            if lower is not None and upper is not None and resolved_pool_id:
+                _proto_pos, _ = self.derive_protocol_position_pda(resolved_pool_id, int(lower), int(upper))
         except Exception:
-            proto_pos = None
+            pass
         # Rewards (fees) acumulados si pueden inferirse del struct de posición
         rewards_a = None
         rewards_b = None
@@ -3079,7 +3090,7 @@ class RaydiumAdapter:
                     pass
         return {
             "ok": True,
-            "ticks": {"lower": lower, "upper": upper, "current": self.get_pool_tick_current(pool_id)},
+            "ticks": {"lower": lower, "upper": upper, "current": self.get_pool_tick_current(resolved_pool_id)},
             "liquidity": liq,
             "rewards": {"amount0": rewards_a, "amount1": rewards_b},
         }
@@ -3090,7 +3101,7 @@ class RaydiumAdapter:
         out: List[Dict[str, Any]] = []
         for p in positions:
             try:
-                out.append(self.position_belongs_to_pool(p, pool_id or ""))
+                out.append(self.position_belongs_to_pool(p, pool_id))
             except Exception as exc:
                 out.append({"ok": False, "position": p, "error": str(exc)})
         return {"ok": True, "positions": out}
