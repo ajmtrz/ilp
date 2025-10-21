@@ -3107,11 +3107,11 @@ class RaydiumAdapter:
         return {"ok": True, "positions": out}
 
     def list_positions(self) -> Dict[str, Any]:
-        """Lista NFTs de posición (mints) pertenecientes al owner.
+        """Lista NFTs de posición (mints) pertenecientes al owner e incluye pool_id resuelto.
         Estrategia: escanear cuentas SPL del owner (Token y Token-2022) con amount=1 y decimals=0;
-        validar que exista la cuenta PersonalPosition PDA derivada del mint.
+        validar que exista la cuenta PersonalPosition PDA derivada del mint y leer la pool.
         """
-        positions: List[str] = []
+        items: List[Dict[str, Any]] = []
         try:
             # Reutilizar RPC de wallet_state para ambos programas
             for program_id in (
@@ -3153,15 +3153,28 @@ class RaydiumAdapter:
                         try:
                             pda, _ = self._derive_personal_position_pda(mint)
                             pos_acc = self._get_account_info_base64(pda)
-                            if pos_acc:
-                                positions.append(mint)
+                            if not pos_acc:
+                                continue
+                            # Leer detalles para resolver pool_id
+                            pool_id_resolved: Optional[str] = None
+                            try:
+                                pos_dec = self._read_position_core(mint)
+                                for k in ("pool", "pool_id", "poolState", "pool_state", "poolId", "poolKey", "poolAddress"):
+                                    if k in pos_dec:
+                                        v = pos_dec[k]
+                                        if isinstance(v, str) and len(v) > 0:
+                                            pool_id_resolved = v
+                                            break
+                            except Exception:
+                                pool_id_resolved = None
+                            items.append({"position": mint, "pool_id": pool_id_resolved})
                         except Exception:
                             continue
                     except Exception:
                         continue
         except Exception:
             pass
-        return {"ok": True, "positions": positions}
+        return {"ok": True, "positions": items}
 
     def _extract_ticks_from_position(self, pos: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
         lower = None

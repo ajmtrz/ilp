@@ -3141,12 +3141,12 @@ class SaucerSwapAdapter:
         return {"ok": True, "positions": out_all}
 
     def list_positions(self) -> Dict[str, Any]:
-        """Lista seriales de posiciones (NFTs) que pertenecen al owner en SaucerSwap."""
+        """Lista posiciones (serial y pool_id) que pertenecen al owner en SaucerSwap."""
         try:
             all_positions = self._saucerswap_positions(self.account_id)
         except Exception as exc:
             return {"ok": False, "error": f"saucerswap api failed: {exc}"}
-        serials: List[str] = []
+        items: List[Dict[str, Any]] = []
         for pos in (all_positions or []):
             try:
                 sn = pos.get("tokenSN")
@@ -3165,10 +3165,24 @@ class SaucerSwapAdapter:
                             continue
                 if liq_val is not None and liq_val <= 0:
                     continue
-                serials.append(str(int(sn)))
+                # resolver poolId si está disponible o derivarlo por tokens+fee
+                pid = pos.get("poolId") or ((pos.get("pool") or {}).get("id"))
+                if pid is None:
+                    try:
+                        t0 = ((pos or {}).get("token0") or {}).get("id")
+                        t1 = ((pos or {}).get("token1") or {}).get("id")
+                        fee_bps = int((pos or {}).get("fee")) if (pos or {}).get("fee") is not None else None
+                        if isinstance(t0, str) and isinstance(t1, str) and isinstance(fee_bps, int):
+                            pe = self.pool_exists(t0, t1, fee_bps)
+                            cand = (pe or {}).get("poolId")
+                            if cand is not None:
+                                pid = cand
+                    except Exception:
+                        pid = None
+                items.append({"position": str(int(sn)), "pool_id": pid})
             except Exception:
                 continue
-        return {"ok": True, "positions": serials}
+        return {"ok": True, "positions": items}
 
 
 __all__ = ["SaucerSwapAdapter", "SaucerSwapConfig"]
