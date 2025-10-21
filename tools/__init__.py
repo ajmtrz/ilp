@@ -16,7 +16,7 @@ def get_pool_positions_status(*, protocol: str, project_root: str = "/root/Repos
     return adapter.positions_status(pool_id=pool_id, positions=position_ids)
 
 
-def get_position_rewards(*, protocol: str, project_root: str = "/root/Repositorios/ild", position_id: str, pool_id: Optional[str] = None) -> Dict[str, Any]:
+def collect_position_rewards(*, protocol: str, project_root: str = "/root/Repositorios/ild", position_id: str, pool_id: Optional[str] = None) -> Dict[str, Any]:
     factory = AdapterFactory(project_root)
     adapter = factory.get(protocol)
     return adapter.collect_rewards(pool_id=pool_id, position_id=position_id)
