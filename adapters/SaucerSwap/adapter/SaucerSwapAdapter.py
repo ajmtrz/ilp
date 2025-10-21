@@ -2711,7 +2711,7 @@ class SaucerSwapAdapter:
                 self.logger.info("send_tx: receipt status=%s gasUsed=%s", (receipt or {}).get("status"), (receipt or {}).get("gasUsed"))
         return out
 
-    def swap_send(self, prep: Dict[str, Any], wait: bool = True, sweep_whbar: bool = False) -> Dict[str, Any]:
+    def swap_send(self, prep: Dict[str, Any], wait: bool = True) -> Dict[str, Any]:
         results: Dict[str, Any] = {"steps": []}
         # 1) approve si existe
         approve = prep.get("approve")
@@ -2725,16 +2725,40 @@ class SaucerSwapAdapter:
             txs["value"] = prep["value"]
         res_s = self.send_transaction(txs, wait=wait)
         results["steps"].append({"swap": res_s})
-        # 3) Barrido WHBAR opcional (post-swap residual). Desactivado por defecto para no interferir con mint.
-        if sweep_whbar or prep.get("sweep_whbar") is True:
-            try:
-                owner = prep.get("from") or self.evm_address
-                sweep = self._whbar_sweep_unwrap(owner)
-                if sweep and (sweep.get("executed") or sweep.get("skipped")):
-                    results["steps"].append({"whbar_sweep": sweep})
-            except Exception as exc:
-                results["steps"].append({"whbar_sweep": {"error": str(exc)}})
+        # 3) Barrido WHBAR obligatorio (post-swap residual) mediante helper dedicado
+        try:
+            owner = prep.get("from") or self.evm_address
+            sweep = self._whbar_sweep_unwrap(owner)
+            if sweep and (sweep.get("executed") or sweep.get("skipped") or sweep.get("error")):
+                results["steps"].append({"whbar_sweep": sweep})
+        except Exception as exc:
+            results["steps"].append({"whbar_sweep": {"error": str(exc)}})
         return results
+
+    def swap(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Convenience: prepara y envía un swap en un único método."""
+        # Si no viene swap_quote.path, construirlo vía get_quote (token_in, token_out, amount, fee_bps, kind)
+        swap_quote = params or {}
+        try:
+            needs_quote = isinstance(swap_quote, dict) and ("path" not in swap_quote)
+            if needs_quote:
+                kind = swap_quote.get("kind") or swap_quote.get("type") or "exact_in"
+                token_in = swap_quote.get("token_in") or swap_quote.get("inputMint") or swap_quote.get("in")
+                token_out = swap_quote.get("token_out") or swap_quote.get("outputMint") or swap_quote.get("out")
+                amount = swap_quote.get("amount") or swap_quote.get("amount_in") or swap_quote.get("amountIn")
+                fee_bps = swap_quote.get("fee_bps") or swap_quote.get("feeBps")
+                if token_in and token_out and amount is not None and fee_bps is not None:
+                    swap_quote = self.get_quote(str(token_in), str(token_out), int(amount), str(kind), int(fee_bps))
+        except Exception:
+            pass
+
+        prep = self.swap_prepare(
+            swap_quote,
+            slippage_bps=int(params.get("slippage_bps", 50)) if isinstance(params, dict) else 50,
+            deadline_s=int(params.get("deadline_s", 300)) if isinstance(params, dict) else 300,
+            recipient_evm=params.get("recipient") if isinstance(params, dict) else None,
+        )
+        return self.swap_send(prep, wait=True)
 
     # ---------------- Allowance (ERC20.approve) ----------------
     def approve_prepare(self, token_in: str, amount: int, spender: Optional[str] = None, owner_evm: Optional[str] = None) -> Dict[str, Any]:

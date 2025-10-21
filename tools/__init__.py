@@ -21,3 +21,9 @@ def get_position_rewards(*, protocol: str, project_root: str = "/root/Repositori
     adapter = factory.get(protocol)
     return adapter.collect_rewards(pool_id=pool_id, position_id=position_id)
 
+
+def execute_swap(*, protocol: str, project_root: str = "/root/Repositorios/ild", params: Dict[str, Any]) -> Dict[str, Any]:
+    factory = AdapterFactory(project_root)
+    adapter = factory.get(protocol)
+    return adapter.swap(params)  # type: ignore
+

@@ -1935,6 +1935,19 @@ class RaydiumAdapter:
             except Exception:
                 return None
 
+        def _is_valid_sig(sig: Optional[str]) -> bool:
+            if not isinstance(sig, str) or not sig:
+                return False
+            # placeholder común cuando el RPC está rate limited
+            if sig == "1111111111111111111111111111111111111111111111111111111111111111":
+                return False
+            try:
+                import re
+                # Base58 chars y longitud típica (>=43)
+                return re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{43,88}", sig) is not None
+            except Exception:
+                return True
+
         extra_signers: List[Any] = []
         try:
             flat_extras = prep.get("extraSigners") or []
@@ -1954,17 +1967,52 @@ class RaydiumAdapter:
         for tx_b64 in prep.get("transactions", []):
             raw = __import__("base64").b64decode(tx_b64)
             sig: Optional[str] = None
-            # 1) Intentar decodificar como VersionedTransaction
+            # 1) Intentar decodificar como MessageV0 y firmar localmente
             try:
-                vtx = VersionedTransaction.from_bytes(raw)
-            except Exception:
-                vtx = None
-            # 2) Si no es una tx completa, construirla desde MessageV0
-            if vtx is None:
+                from solders.message import MessageV0  # type: ignore
+                msg = MessageV0.from_bytes(raw)
+                # Construir lista de firmantes requerida en orden
+                ordered_signers: List[Any] = []
                 try:
-                    from solders.message import MessageV0  # type: ignore
-                    msg = MessageV0.from_bytes(raw)
-                    # Construir lista de firmantes requerida en orden
+                    hdr = getattr(msg, "header", None)
+                    num_req = int(getattr(hdr, "num_required_signatures", 0)) if hdr is not None else 0
+                    signer_map = {str(kp.pubkey()): kp}
+                    for ex in (extra_signers or []):
+                        try:
+                            signer_map[str(ex.pubkey())] = ex
+                        except Exception:
+                            continue
+                    try:
+                        static_keys = [str(pk) for pk in list(getattr(msg, "static_account_keys", []) or [])]
+                    except Exception:
+                        static_keys = []
+                    if not static_keys:
+                        ordered_signers = [kp] + list((extra_signers or []))
+                        if num_req > 0:
+                            ordered_signers = ordered_signers[:num_req]
+                    else:
+                        required_keys = static_keys[:num_req] if num_req > 0 else []
+                        for sk in required_keys:
+                            s_obj = signer_map.get(sk)
+                            if s_obj is None and sk == str(kp.pubkey()):
+                                s_obj = kp
+                            if s_obj is not None:
+                                ordered_signers.append(s_obj)
+                        if num_req > 0 and len(ordered_signers) > num_req:
+                            ordered_signers = ordered_signers[:num_req]
+                        if num_req > 0 and len(ordered_signers) < num_req and self.logger.isEnabledFor(logging.ERROR):
+                            self.logger.error("firmado insuficiente tras ordenar: required=%d provided=%d", num_req, len(ordered_signers))
+                except Exception:
+                    ordered_signers = [kp] + list((extra_signers or []))
+                vtx = VersionedTransaction(msg, ordered_signers)
+            except Exception:
+                # 2) Si no es un mensaje, intentar decodificar como tx completa y re-firmarla con nuestro keypair
+                try:
+                    tmp_vtx = VersionedTransaction.from_bytes(raw)
+                    # reconstruir orden de firmantes y firmar sobre el message de la tx
+                    msg = getattr(tmp_vtx, "message", None)
+                    if msg is None:
+                        raise ValueError("transaction sin message")
                     ordered_signers: List[Any] = []
                     try:
                         hdr = getattr(msg, "header", None)
@@ -2002,14 +2050,18 @@ class RaydiumAdapter:
                     self.logger.error("Error construyendo VersionedTransaction: %s", exc_build)
                     receipts.append({"error": str(exc_build)})
                     continue
-            # 3) Enviar
+            # 3) Enviar una sola vez; si la firma es inválida, reportar error sin reintentos
             try:
-                opts = TxOpts(skip_preflight=True, preflight_commitment="confirmed")
+                opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=0)
                 resp = client.send_raw_transaction(bytes(vtx), opts=opts)
                 sig = _extract_sig(resp)
             except Exception as exc:
                 self.logger.error("Error enviando transacción v0: %s", exc)
                 receipts.append({"error": str(exc)})
+                continue
+            if not _is_valid_sig(sig):
+                self.logger.error("Firma no válida o placeholder devuelta por el RPC")
+                receipts.append({"error": "firma inválida del RPC"})
                 continue
 
             signatures.append(sig)
@@ -2022,6 +2074,35 @@ class RaydiumAdapter:
                     receipts.append({"warn": f"confirm failed: {exc}"})
 
         return {"signatures": signatures, "receipts": receipts}
+
+    def swap(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Convenience: prepara y envía un swap en un único método."""
+        # Si no es un swap_quote (falta swapResponse), autogenerarlo con get_quote
+        swap_input = params or {}
+        if not isinstance(swap_input, dict):
+            raise ValueError("params inválido para swap")
+        if "swapResponse" not in swap_input:
+            kind = swap_input.get("kind") or swap_input.get("type") or "exact_in"
+            input_mint = swap_input.get("inputMint") or swap_input.get("input_mint")
+            output_mint = swap_input.get("outputMint") or swap_input.get("output_mint")
+            amount = (
+                swap_input.get("amount")
+                or swap_input.get("amount_in")
+                or swap_input.get("amountIn")
+            )
+            slippage_bps = (
+                swap_input.get("slippage_bps")
+                or swap_input.get("slippageBps")
+                or 50
+            )
+            if not input_mint or not output_mint or amount is None:
+                raise ValueError("Faltan campos para construir quote: inputMint, outputMint, amount")
+            quote = self.get_quote(
+                str(input_mint), str(output_mint), int(amount), str(kind), int(slippage_bps)
+            )
+            swap_input = quote
+        prep = self.swap_prepare(swap_input)
+        return self.swap_send(prep)
 
     def send_versioned_tx_base64(self, tx_b64: str, wait: bool = True) -> Dict[str, Any]:
         """Envía una transacción V0 en base64 directamente (firma con la keypair configurada).
