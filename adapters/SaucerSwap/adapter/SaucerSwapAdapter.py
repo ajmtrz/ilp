@@ -3140,5 +3140,35 @@ class SaucerSwapAdapter:
                 continue
         return {"ok": True, "positions": out_all}
 
+    def list_positions(self) -> Dict[str, Any]:
+        """Lista seriales de posiciones (NFTs) que pertenecen al owner en SaucerSwap."""
+        try:
+            all_positions = self._saucerswap_positions(self.account_id)
+        except Exception as exc:
+            return {"ok": False, "error": f"saucerswap api failed: {exc}"}
+        serials: List[str] = []
+        for pos in (all_positions or []):
+            try:
+                sn = pos.get("tokenSN")
+                if sn is None:
+                    continue
+                # Filtrar solo activas: no deleted y con liquidez > 0 si el campo existe
+                if pos.get("deleted") is True:
+                    continue
+                liq_val = None
+                for k in ("liquidity", "position_liquidity", "liq"):
+                    if k in pos:
+                        try:
+                            liq_val = int(pos[k])
+                            break
+                        except Exception:
+                            continue
+                if liq_val is not None and liq_val <= 0:
+                    continue
+                serials.append(str(int(sn)))
+            except Exception:
+                continue
+        return {"ok": True, "positions": serials}
+
 
 __all__ = ["SaucerSwapAdapter", "SaucerSwapConfig"]

@@ -3095,6 +3095,63 @@ class RaydiumAdapter:
                 out.append({"ok": False, "position": p, "error": str(exc)})
         return {"ok": True, "positions": out}
 
+    def list_positions(self) -> Dict[str, Any]:
+        """Lista NFTs de posición (mints) pertenecientes al owner.
+        Estrategia: escanear cuentas SPL del owner (Token y Token-2022) con amount=1 y decimals=0;
+        validar que exista la cuenta PersonalPosition PDA derivada del mint.
+        """
+        positions: List[str] = []
+        try:
+            # Reutilizar RPC de wallet_state para ambos programas
+            for program_id in (
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            ):
+                try:
+                    resp = self._rpc_call_with_failover(
+                        "getTokenAccountsByOwner",
+                        [
+                            self.owner_pubkey,
+                            {"programId": program_id},
+                            {"commitment": "finalized", "encoding": "jsonParsed"},
+                        ],
+                    )
+                    value = ((resp or {}).get("result") or {}).get("value") or []
+                except Exception:
+                    value = []
+                for it in value:
+                    try:
+                        parsed = (((it or {}).get("account") or {}).get("data") or {}).get("parsed") or {}
+                        info = parsed.get("info") or {}
+                        mint = info.get("mint")
+                        ta = info.get("tokenAmount") or {}
+                        amount = ta.get("amount")
+                        decimals = ta.get("decimals")
+                        if not isinstance(mint, str):
+                            continue
+                        if not (isinstance(decimals, int) and decimals == 0):
+                            continue
+                        # amount puede venir como str "1"
+                        try:
+                            amt_i = int(amount) if isinstance(amount, str) else int(str(amount))
+                        except Exception:
+                            continue
+                        if amt_i != 1:
+                            continue
+                        # Validar que el mint corresponde a una posición CLMM (existe PersonalPosition PDA)
+                        try:
+                            pda, _ = self._derive_personal_position_pda(mint)
+                            pos_acc = self._get_account_info_base64(pda)
+                            if pos_acc:
+                                positions.append(mint)
+                        except Exception:
+                            continue
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return {"ok": True, "positions": positions}
+
     def _extract_ticks_from_position(self, pos: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
         lower = None
         upper = None
