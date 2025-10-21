@@ -759,6 +759,67 @@ class SaucerSwapAdapter:
         data = r.json()
         return data if isinstance(data, list) else []
 
+    def position_belongs_to_pool(self, position: Union[int, str], pool_id: Optional[Union[int, str]] = None) -> Dict[str, Any]:
+        """Busca una posición por position (NFT) del owner y reporta si pertenece a la pool indicada.
+        Devuelve detalles limpios y bandera belongs.
+        """
+        if position is None:
+            return {"ok": False, "error": "missing position"}
+        try:
+            positions = self._saucerswap_positions(self.account_id)
+        except Exception as exc:
+            return {"ok": False, "error": f"saucerswap api failed: {exc}"}
+        target = None
+        for pos in positions:
+            try:
+                if int(pos.get("tokenSN")) == int(position):
+                    target = self._strip_fields(pos)
+                    break
+            except Exception:
+                continue
+        if not target:
+            return {"ok": False, "position": int(position), "error": "position not found"}
+        pid = target.get("poolId") or target.get("pool_id") or ((target.get("pool") or {}).get("id"))
+        if pid is None:
+            # Resolver poolId vía tokens+fee si no viene en la respuesta
+            try:
+                t0 = ((target or {}).get("token0") or {}).get("id")
+                t1 = ((target or {}).get("token1") or {}).get("id")
+                fee_bps = int((target or {}).get("fee")) if (target or {}).get("fee") is not None else None
+                if isinstance(t0, str) and isinstance(t1, str) and isinstance(fee_bps, int):
+                    pe = self.pool_exists(t0, t1, fee_bps)
+                    cand = (pe or {}).get("poolId")
+                    if cand is not None:
+                        pid = cand
+            except Exception:
+                pass
+        belongs = True if pool_id is None else (str(pid) == str(pool_id))
+        # tick actual de la pool desde REST
+        try:
+            st = self.get_pool_state_decoded(int(pid)) if pid is not None else {}
+            tick_current = (st or {}).get("tick_current_index")
+        except Exception:
+            tick_current = None
+        # Normalizar salida al formato agnóstico
+        try:
+            liq_raw = int((target or {}).get("liquidity")) if isinstance((target or {}).get("liquidity"), str) else int((target or {}).get("liquidity", 0))
+        except Exception:
+            liq_raw = 0
+        # fees acumuladas (tokensOwed0/1) si están presentes
+        def _parse_int(x: Any) -> Optional[int]:
+            try:
+                if x is None:
+                    return None
+                return int(x)
+            except Exception:
+                try:
+                    return int(str(x))
+                except Exception:
+                    return None
+        rewards = {"amount0": _parse_int((target or {}).get("tokensOwed0")), "amount1": _parse_int((target or {}).get("tokensOwed1"))}
+        ticks = {"lower": _parse_int((target or {}).get("tickLower")), "upper": _parse_int((target or {}).get("tickUpper")), "current": _parse_int(tick_current)}
+        return {"ok": True, "ticks": ticks, "liquidity": liq_raw, "rewards": rewards}
+
     # ---------------- Pools helpers (REST/on-chain) ----------------
     def pool_exists(self, tokenA: str, tokenB: str, fee_bps: int) -> Dict[str, Any]:
         """Comprueba existencia de una pool V2 por tokens HTS/HBAR y fee (bps) usando REST.
@@ -2932,6 +2993,34 @@ class SaucerSwapAdapter:
             self.logger.warning("eth_estimateGas associate failed: %s", exc)
 
         return {"to": precompile, "data": "0x" + calldata.hex(), "from": owner, "gasEstimate": gas_estimate, "tokens": tokens_evm}
+
+    def positions_status(self, pool_id: Optional[Union[int, str]] = None, positions: Optional[List[Union[int, str]]] = None) -> Dict[str, Any]:
+        """Interfaz estándar: si 'positions' se pasa, devuelve estado por cada serial; si no, lista todas y filtra por pool.
+        """
+        try:
+            all_positions = self._saucerswap_positions(self.account_id)
+        except Exception as exc:
+            return {"ok": False, "error": f"saucerswap api failed: {exc}"}
+        if positions:
+            out: List[Dict[str, Any]] = []
+            for s in positions:
+                try:
+                    out.append(self.position_belongs_to_pool(s, pool_id))
+                except Exception as exc:
+                    out.append({"ok": False, "error": str(exc)})
+            return {"ok": True, "positions": out}
+        # sin lista: mapear todas las posiciones del owner al formato unificado
+        out_all: List[Dict[str, Any]] = []
+        for pos in all_positions:
+            try:
+                serial = int(pos.get("tokenSN"))
+            except Exception:
+                continue
+            try:
+                out_all.append(self.position_belongs_to_pool(serial, pool_id))
+            except Exception:
+                continue
+        return {"ok": True, "positions": out_all}
 
 
 __all__ = ["SaucerSwapAdapter", "SaucerSwapConfig"]
