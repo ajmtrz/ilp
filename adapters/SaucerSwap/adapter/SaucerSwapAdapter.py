@@ -2306,6 +2306,100 @@ class SaucerSwapAdapter:
             self.logger.info("get_quote: %s -> %s result=%s", token_in, token_out, {k: out[k] for k in ("amountOut","amountIn","gasEstimate") if k in out})
         return out
 
+    # ---------------- Collect fees/rewards (position) ----------------
+    def collect_rewards(self, pool_id: str, position_id: Union[int, str]) -> Dict[str, Any]:
+        """Colecciona las fees/rewards acumuladas de una posición (serial HTS) hacia la wallet (owner).
+        Implementado vía NonfungiblePositionManager.collect para token0 y token1.
+        """
+        try:
+            from eth_abi import encode as abi_encode  # type: ignore
+            import eth_utils  # type: ignore
+        except Exception as exc:
+            return {"ok": False, "error": f"faltan dependencias eth_abi/eth_utils: {exc}"}
+
+        self._ensure_npm_abi_loaded()
+        npm = self._get_npm_address_evm()
+        if not npm:
+            return {"ok": False, "error": "nonfungible_position_manager no configurado"}
+
+        owner = self.evm_address
+        try:
+            serial = int(position_id)
+        except Exception:
+            return {"ok": False, "error": "position inválida (serial)"}
+
+        # collect(uint256,address,uint128,uint128) selector 0xfc6f7865
+        sel_collect = bytes.fromhex("fc6f7865")
+        max_u128 = (1 << 128) - 1
+        col0 = sel_collect + abi_encode(["uint256", "address", "uint128", "uint128"], [serial, owner, max_u128, 0])
+        col1 = sel_collect + abi_encode(["uint256", "address", "uint128", "uint128"], [serial, owner, 0, max_u128])
+
+        # multicall(bytes[])
+        entry_mc = self._abi_find_function(self._npm_abi, "multicall", ["bytes[]"]) or {}
+        sel_mc = self._abi_selector_from_entry(entry_mc) or eth_utils.keccak(text="multicall(bytes[])")[:4]
+        calldata = sel_mc + abi_encode(["bytes[]"], [[col0, col1]])
+
+        tx = {"from": owner, "to": npm, "data": "0x" + calldata.hex()}
+        try:
+            gas_estimate = self._call_rpc("eth_estimateGas", [tx, "latest"])  # may raise
+            if isinstance(gas_estimate, str):
+                gas_estimate = int(gas_estimate, 16)
+            tx["gas"] = int(gas_estimate) or 1_000_000
+        except Exception:
+            tx["gas"] = 1_000_000
+
+        res = self.send_transaction(tx, wait=True)
+        # Intentar extraer amount0/amount1 desde los logs del receipt usando el contrato de pool
+        amount0: Optional[int] = None
+        amount1: Optional[int] = None
+        try:
+            # Resolver poolId del serial
+            pos = None
+            try:
+                for p in self._saucerswap_positions(self.account_id):
+                    if int(p.get("tokenSN")) == int(serial):
+                        pos = p; break
+            except Exception:
+                pos = None
+            pid = None
+            if pos:
+                pid = pos.get("poolId") or pos.get("pool_id") or ((pos.get("pool") or {}).get("id"))
+            pool_evm = None
+            if pid is not None:
+                info = self.get_pool_info(int(pid)) or {}
+                pool_evm = info.get("contractAddress") or info.get("contract_address")
+            # Parseo de logs: buscar eventos del contrato de pool y tomar las dos últimas palabras como amounts
+            logs = (((res or {}).get("receipt") or {}).get("logs") or [])
+            for lg in logs:
+                try:
+                    if pool_evm and str(lg.get("address", "")).lower() != str(pool_evm).lower():
+                        continue
+                    data_hex = lg.get("data") or "0x"
+                    if not (isinstance(data_hex, str) and data_hex.startswith("0x")):
+                        continue
+                    raw = bytes.fromhex(data_hex[2:])
+                    # Necesitamos al menos 64 bytes para amount0/amount1 (uint128 cada uno ocupa 16 bytes, pero ABI words son 32)
+                    if len(raw) >= 64:
+                        # Tomar las últimas dos words (64 bytes) como amounts potenciales
+                        w1 = int.from_bytes(raw[-32:], byteorder="big", signed=False)
+                        w0 = int.from_bytes(raw[-64:-32], byteorder="big", signed=False)
+                        # Heurística: si alguno es cero, mantener el otro; acumular si múltiples logs
+                        amount0 = (0 if amount0 is None else amount0) + (w0 or 0)
+                        amount1 = (0 if amount1 is None else amount1) + (w1 or 0)
+                    elif len(raw) >= 32:
+                        # Un único amount (algunas rutas emiten un solo valor)
+                        v = int.from_bytes(raw[-32:], byteorder="big", signed=False)
+                        # A falta de contexto, asumir token0
+                        amount0 = (0 if amount0 is None else amount0) + v
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        result = {"collect": res}
+        if amount0 is not None or amount1 is not None:
+            result["amounts"] = {"amount0": amount0 or 0, "amount1": amount1 or 0}
+        return {"ok": True, "result": result}
+
     # ---------------- Swap (preparación) ----------------
     def swap_prepare(self, swap_quote: Dict[str, Any], slippage_bps: int = 50, deadline_s: int = 300, recipient_evm: Optional[str] = None) -> Dict[str, Any]:
         from eth_abi import encode as abi_encode  # type: ignore

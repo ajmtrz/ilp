@@ -2023,6 +2023,75 @@ class RaydiumAdapter:
 
         return {"signatures": signatures, "receipts": receipts}
 
+    def send_versioned_tx_base64(self, tx_b64: str, wait: bool = True) -> Dict[str, Any]:
+        """Envía una transacción V0 en base64 directamente (firma con la keypair configurada).
+        Devuelve {signature, confirmation?}.
+        """
+        try:
+            from solana.rpc.api import Client  # type: ignore
+            from solana.rpc.types import TxOpts  # type: ignore
+            from solders.transaction import VersionedTransaction  # type: ignore
+            from solders.signature import Signature as SolSig  # type: ignore
+            from solders.keypair import Keypair  # type: ignore
+            from solders.message import MessageV0  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            return {"ok": False, "error": f"Faltan dependencias para V0: {exc}"}
+
+        kp = self._load_solana_keypair()
+        client = self._rpc_client()
+        try:
+            raw = __import__("base64").b64decode(tx_b64)
+        except Exception as exc:
+            return {"ok": False, "error": f"tx_b64 inválida: {exc}"}
+
+        # Intentar decodificar como tx completa; si es message, firmar con kp
+        vtx = None
+        try:
+            vtx = VersionedTransaction.from_bytes(raw)
+        except Exception:
+            vtx = None
+        if vtx is None:
+            try:
+                msg = MessageV0.from_bytes(raw)
+                vtx = VersionedTransaction(msg, [kp])
+            except Exception as exc:
+                return {"ok": False, "error": f"No se pudo reconstruir VersionedTransaction: {exc}"}
+
+        try:
+            opts = TxOpts(skip_preflight=True, preflight_commitment="confirmed")
+            resp = client.send_raw_transaction(bytes(vtx), opts=opts)
+            # Extraer firma de forma robusta (dict | objeto | string)
+            sig: Optional[str] = None
+            if isinstance(resp, dict):
+                sig = resp.get("result") or resp.get("value") or resp.get("signature")
+            if not sig:
+                val = getattr(resp, "value", None)
+                if isinstance(val, str):
+                    sig = val
+            if not sig:
+                try:
+                    s = str(resp)
+                    # Buscar patrón Signature(<base58>)
+                    import re as _re
+                    m = _re.search(r"Signature\(([1-9A-HJ-NP-Za-km-z]{32,})\)", s)
+                    if m:
+                        sig = m.group(1)
+                    else:
+                        sig = s
+                except Exception:
+                    sig = None
+            out: Dict[str, Any] = {"ok": True, "signature": sig}
+            if wait and isinstance(sig, str):
+                try:
+                    sig_obj = SolSig.from_string(sig)
+                    conf = client.confirm_transaction(sig_obj, commitment="confirmed")
+                    out["confirmation"] = conf
+                except Exception as cexc:
+                    out["warn"] = f"confirm failed: {cexc}"
+            return out
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     # ---------------- HTTP helpers (Raydium Trade API) ----------------
     def _api_get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Dict[str, Any]:
         import requests
@@ -3219,6 +3288,131 @@ class RaydiumAdapter:
                 "rewardTriples": reward_triples,
             },
             "notes": [],
+        }
+
+    def collect_rewards(self, pool_id: str, position_id: str) -> Dict[str, Any]:
+        """Prepara y ENVÍA on-chain la tx V0 para coleccionar fees de la posición.
+        Replica el flujo de la UI: compute budget, createAccountWithSeed (WSOL), initializeAccount,
+        decrease_liquidity_v2(liquidity=0), closeAccount WSOL.
+        """
+        # Leer estado de pool y derivados
+        pos = self._read_position_core(position_id)
+        if not pos:
+            return {"ok": False, "error": "position not found"}
+        pool_state = self.get_pool_state_decoded(pool_id)
+        mint0, mint1 = self.get_pool_mints(pool_state)
+        # Derivar cuentas destino
+        recv0 = None
+        createWithSeed: List[Dict[str, Any]] = []
+        postunwrap: List[Dict[str, Any]] = []
+        if self._is_sol_mint(mint0):
+            # Derivar cuenta WSOL temporal por seed determinista
+            try:
+                import hashlib as _hl  # type: ignore
+                from solders.pubkey import Pubkey  # type: ignore
+                seed_raw = _hl.sha256((position_id + ":wsol").encode("utf-8")).hexdigest()[:32]
+                base_pk = Pubkey.from_string(self.owner_pubkey)
+                token_prog_pk = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                new_pk = Pubkey.create_with_seed(base_pk, seed_raw, token_prog_pk)
+                recv0 = str(new_pk)
+                # Rent estimado para token account + cerrar tras collect
+                rent_lamports = 2_039_280
+                createWithSeed.append({"base": self.owner_pubkey, "seed": seed_raw, "newAccount": recv0, "lamports": rent_lamports})
+                postunwrap.append({"kind": "unwrap", "ata": recv0})
+            except Exception:
+                recv0 = self._derive_ata(self.owner_pubkey, self.SOL_MINT)
+        else:
+            recv0 = self._derive_ata(self.owner_pubkey, mint0)
+        recv1 = self._derive_ata(self.owner_pubkey, mint1)
+
+        # Construir ix principal con liquidez=0
+        try:
+            ix_dec = self.build_decrease_liquidity_v2_ix(
+                pool_id=pool_id,
+                position_nft_mint=position_id,
+                amount_liquidity=0,
+                amount0_min=0,
+                amount1_min=0,
+                recipient_token_account_0=recv0,
+                recipient_token_account_1=recv1,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+        # Compute budget como en la UI
+        cb = {"microLamports": 25000, "units": 600000}
+        anc = {"anchor": {"ix": ix_dec, "computeBudget": cb, "prewrap": [], "postunwrap": postunwrap, "createATAs": [], "createWithSeed": createWithSeed}}
+        try:
+            tx_b64, extras = self._assemble_v0_from_anchor(anc)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+        # Enviar directamente la transacción preparada
+        send_res = self.send_versioned_tx_base64(tx_b64, wait=True)
+        # Intentar extraer amounts transferidos (token0/token1) desde getTransaction jsonParsed
+        amounts: Dict[str, Optional[int]] = {"amount0": None, "amount1": None}
+        try:
+            sig = None
+            if isinstance(send_res, dict):
+                sig = send_res.get("signature") or ((send_res.get("confirmation") or {}).get("result") or {}).get("value")
+                # Si confirmation devuelve estructura distinta, ignorar
+            if isinstance(sig, str) and len(sig) > 0:
+                txj = self._rpc_call_with_failover("getTransaction", [sig, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+                res = (txj or {}).get("result") or {}
+                meta = (res.get("meta") or {})
+                inner = meta.get("innerInstructions") or []
+                # Calcular recipients esperados (derivados arriba)
+                # Recalcular recipients para robustez
+                pool_state = self.get_pool_state_decoded(pool_id)
+                mint0, mint1 = self.get_pool_mints(pool_state)
+                recv0_calc = None
+                if self._is_sol_mint(mint0):
+                    try:
+                        import hashlib as _hl  # type: ignore
+                        from solders.pubkey import Pubkey  # type: ignore
+                        seed_raw = _hl.sha256((position_id + ":wsol").encode("utf-8")).hexdigest()[:32]
+                        base_pk = Pubkey.from_string(self.owner_pubkey)
+                        token_prog_pk = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                        new_pk = Pubkey.create_with_seed(base_pk, seed_raw, token_prog_pk)
+                        recv0_calc = str(new_pk)
+                    except Exception:
+                        recv0_calc = self._derive_ata(self.owner_pubkey, self.SOL_MINT)
+                else:
+                    recv0_calc = self._derive_ata(self.owner_pubkey, mint0)
+                recv1_calc = self._derive_ata(self.owner_pubkey, mint1)
+
+                def _sum_amount_for_dest(dest: Optional[str]) -> Optional[int]:
+                    if not isinstance(dest, str) or not dest:
+                        return None
+                    total = 0
+                    found = False
+                    for ii in inner:
+                        for ins in (ii.get("instructions") or []):
+                            p = ins.get("parsed") or {}
+                            if (ins.get("program") == "spl-token") and isinstance(p, dict) and p.get("type") == "transferChecked":
+                                info = p.get("info") or {}
+                                if str(info.get("destination")) == dest:
+                                    try:
+                                        amt = info.get("tokenAmount", {}).get("amount") or info.get("amount")
+                                        val = int(amt) if not isinstance(amt, dict) else int(amt.get("amount"))
+                                        total += val
+                                        found = True
+                                    except Exception:
+                                        continue
+                    return total if found else None
+
+                amounts["amount0"] = _sum_amount_for_dest(recv0_calc)
+                amounts["amount1"] = _sum_amount_for_dest(recv1_calc)
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "transactions": [tx_b64],
+            "extraSigners": extras or [],
+            "meta": {"poolId": pool_id, "position": position_id},
+            "send": send_res,
+            "result": {"amounts": amounts} if (amounts.get("amount0") is not None or amounts.get("amount1") is not None) else {},
         }
 
     def build_close_position_ix(self, position_nft_mint: str) -> Dict[str, Any]:
