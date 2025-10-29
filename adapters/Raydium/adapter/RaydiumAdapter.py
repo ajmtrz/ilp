@@ -2422,6 +2422,50 @@ class RaydiumAdapter:
             raise RuntimeError(f"Cuenta de pool no encontrada: {pool_id}")
         return self._decode_account("PoolState", pool_id, b64) or {}
 
+    def resolve_pool_id(self, token_a: str, token_b: str, fee_bps: int) -> Dict[str, Any]:
+        """Resuelve pool CLMM por mints y fee (bps)."""
+        pool = self._clmm_resolve_pool(token_a, token_b, int(fee_bps))
+        if not pool:
+            return {"ok": False, "error": "pool no encontrada", "args": {"token_a": token_a, "token_b": token_b, "fee_bps": int(fee_bps)}}
+        pid = pool.get("id") or pool.get("poolId") or pool.get("address")
+        return {"ok": True, "pool_id": pid, "pool": pool}
+
+    def get_pool_state(self, pool_id: str) -> Dict[str, Any]:
+        """Devuelve estado normalizado de la pool: tick_current, tick_spacing, liquidity_global, tokens."""
+        if not pool_id:
+            return {"ok": False, "error": "pool_id requerido"}
+        st = self.get_pool_state_decoded(pool_id)
+        # tick_current
+        tick_current = self.get_pool_tick_current(pool_id)
+        # tick_spacing
+        tick_spacing = None
+        for k in ("tick_spacing", "tickSpacing", "tick_spacing_index"):
+            if isinstance(st, dict) and st.get(k) is not None:
+                try:
+                    tick_spacing = int(st.get(k))
+                    break
+                except Exception:
+                    continue
+        # liquidity_global
+        liquidity = None
+        for k in ("liquidity", "liquidity_global", "global_liquidity"):
+            if isinstance(st, dict) and st.get(k) is not None:
+                try:
+                    liquidity = int(st.get(k))
+                    break
+                except Exception:
+                    continue
+        # tokens mints
+        m0, m1 = self.get_pool_mints(st)
+        return {
+            "ok": True,
+            "pool_id": pool_id,
+            "tick_current": tick_current,
+            "tick_spacing": tick_spacing,
+            "liquidity_global": liquidity,
+            "tokens": {"A": {"mint": m0}, "B": {"mint": m1}},
+        }
+
     def get_pool_vaults(self, pool_state: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
         """Extrae direcciones de vaults A/B desde el estado de la pool, tolerando nombres alternativos."""
         if not isinstance(pool_state, dict):

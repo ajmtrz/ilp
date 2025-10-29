@@ -1917,6 +1917,61 @@ class SaucerSwapAdapter:
         }
         return out
 
+    def resolve_pool_id(self, token_a: str, token_b: str, fee_bps: int) -> Dict[str, Any]:
+        """Resuelve pool por tokens y fee usando el lookup del adaptador."""
+        try:
+            pe = self.pool_exists(token_a, token_b, int(fee_bps))
+        except Exception as exc:
+            return {"ok": False, "error": f"lookup failed: {exc}"}
+        pid = (pe or {}).get("poolId")
+        if pid is None:
+            return {"ok": False, "error": "pool no encontrada", "args": {"token_a": token_a, "token_b": token_b, "fee_bps": int(fee_bps)}}
+        return {"ok": True, "pool_id": pid, "pool": pe}
+
+    def get_pool_state(self, pool_id: Union[int, str]) -> Dict[str, Any]:
+        """Devuelve estado normalizado: tick_current, tick_spacing (si disponible), liquidity_global, tokens."""
+        try:
+            info = self.get_pool_info(pool_id)
+        except Exception as exc:
+            return {"ok": False, "error": f"info failed: {exc}"}
+        try:
+            st = self.get_pool_state_decoded(pool_id)
+        except Exception:
+            st = {}
+        # tick_current
+        tick_current = None
+        try:
+            tick_current = int((info or {}).get("tickCurrent")) if (info or {}).get("tickCurrent") is not None else None
+        except Exception:
+            pass
+        if tick_current is None:
+            tick_current = (st or {}).get("tick_current_index")
+        # tick_spacing
+        tick_spacing = None
+        try:
+            ts = (info or {}).get("tickSpacing")
+            tick_spacing = int(ts) if ts is not None else None
+        except Exception:
+            pass
+        # liquidity_global
+        liquidity = None
+        try:
+            liq = (info or {}).get("liquidity")
+            liquidity = int(liq) if liq is not None else None
+        except Exception:
+            pass
+        # tokens mints
+        tA = ((info or {}).get("tokenA") or {}).get("id")
+        tB = ((info or {}).get("tokenB") or {}).get("id")
+        return {
+            "ok": True,
+            "pool_id": str(pool_id),
+            "tick_current": tick_current,
+            "tick_spacing": tick_spacing,
+            "liquidity_global": liquidity,
+            "tokens": {"A": {"mint": tA}, "B": {"mint": tB}},
+        }
+
     def get_pool_state_enriched(self, pool_id: Union[int, str]) -> Dict[str, Any]:
         """Devuelve estado enriquecido con alias token0/1 y tokenA/B, asegurando decimales (int) y priceUsd (float)."""
         st = self.get_pool_state_decoded(pool_id) or {}

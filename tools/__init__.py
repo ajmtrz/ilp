@@ -115,3 +115,28 @@ def close_position(*, protocol: str, project_root: str = "/root/Repositorios/ild
     if hasattr(adapter, "close_position"):
         return adapter.close_position(position_id=position_id, slippage_bps=int(slippage_bps))
     return {"ok": False, "error": "close_position no soportado"}
+
+
+def resolve_pool_id(*, protocol: str, project_root: str = "/root/Repositorios/ild", token_a: str, token_b: str, fee_bps: int) -> Dict[str, Any]:
+    """Resuelve el identificador de pool dado token A/B y fee_bps.
+    Debe delegar en el adaptador (misma firma en todos los protocolos).
+    """
+    factory = AdapterFactory(project_root)
+    adapter = factory.get(protocol)
+    if hasattr(adapter, "resolve_pool_id"):
+        return adapter.resolve_pool_id(token_a=token_a, token_b=token_b, fee_bps=int(fee_bps))
+    return {"ok": False, "error": "resolve_pool_id no soportado"}
+
+
+def get_pool_state(*, protocol: str, project_root: str = "/root/Repositorios/ild", pool_id: str) -> Dict[str, Any]:
+    """Obtiene estado normalizado de la pool (tick_current, tick_spacing, liquidity_global, tokens)."""
+    factory = AdapterFactory(project_root)
+    adapter = factory.get(protocol)
+    if hasattr(adapter, "get_pool_state"):
+        return adapter.get_pool_state(pool_id)
+    # Fallback mínimo si el adaptador aún no expone get_pool_state
+    try:
+        state = adapter.get_pool_state_decoded(pool_id)
+        return {"ok": True, "data": state}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
