@@ -307,6 +307,44 @@ class RaydiumAdapter:
             return ((int(tick) + spacing - 1) // spacing) * spacing
         return (int(tick) // spacing) * spacing
 
+    def range_to_ticks(self, pool_id: str, range_spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Convierte center/width a ticks válidos alineados a tickSpacing de la pool."""
+        # Determinar tick_spacing desde estado on-chain o info API
+        tick_spacing = None
+        try:
+            st = self.get_pool_state_decoded(pool_id) or {}
+            for k in ("tick_spacing", "tickSpacing", "tick_spacing_index"):
+                if st.get(k) is not None:
+                    try:
+                        tick_spacing = int(st.get(k))
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            tick_spacing = None
+        if tick_spacing is None:
+            try:
+                info = self.get_pool_info(pool_id) or {}
+                cfg = info.get("config") or {}
+                if cfg.get("tickSpacing") is not None:
+                    tick_spacing = int(cfg.get("tickSpacing"))
+                elif info.get("tickSpacing") is not None:
+                    tick_spacing = int(info.get("tickSpacing"))
+            except Exception:
+                tick_spacing = None
+        if not isinstance(tick_spacing, int) or tick_spacing <= 0:
+            tick_spacing = 1
+        center = int(range_spec.get("center_tick") or 0)
+        width = int(range_spec.get("width_ticks") or 0)
+        lower = center - (width // 2)
+        upper = center + (width // 2)
+        s_lo = self._snap_tick(lower, tick_spacing, mode="floor")
+        s_up = self._snap_tick(upper, tick_spacing, mode="ceil")
+        snapped = (s_lo, s_up) != (lower, upper)
+        if s_lo >= s_up:
+            return {"ok": False, "error": "tick range colapsó tras snapping", "tick_spacing": tick_spacing}
+        return {"ok": True, "ticks": {"lower": s_lo, "upper": s_up}, "snapped": snapped, "tick_spacing": tick_spacing}
+
     # ---------------- Liquidez CLMM: Quote por ticks ----------------
     def liquidity_quote_by_ticks(
         self,
@@ -338,7 +376,11 @@ class RaydiumAdapter:
         # Validar/snap de ticks según tickSpacing si está disponible
         tick_spacing = None
         try:
-            tick_spacing = int((pool.get("ammConfig") or {}).get("tickSpacing") or pool.get("tickSpacing")) if isinstance(pool, dict) else None
+            tick_spacing = int(
+                (pool.get("ammConfig") or {}).get("tickSpacing")
+                or (pool.get("config") or {}).get("tickSpacing")
+                or pool.get("tickSpacing")
+            ) if isinstance(pool, dict) else None
         except Exception:
             tick_spacing = None
         snapped_lower = int(tick_lower)

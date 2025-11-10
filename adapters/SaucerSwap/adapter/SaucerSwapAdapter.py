@@ -1917,6 +1917,36 @@ class SaucerSwapAdapter:
         }
         return out
 
+    def range_to_ticks(self, pool_id: Union[int, str], range_spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Convierte center/width a ticks válidos alineados a tickSpacing del pool."""
+        # tickSpacing desde API o contrato
+        tick_spacing = None
+        try:
+            info = self.get_pool_info(pool_id) or {}
+            if info.get("tickSpacing") is not None:
+                tick_spacing = int(info.get("tickSpacing"))
+            elif info.get("tick_spacing") is not None:
+                tick_spacing = int(info.get("tick_spacing"))
+        except Exception:
+            tick_spacing = None
+        if not isinstance(tick_spacing, int) or tick_spacing <= 0:
+            tick_spacing = 1
+        center = int(range_spec.get("center_tick") or 0)
+        width = int(range_spec.get("width_ticks") or 0)
+        lower = center - (width // 2)
+        upper = center + (width // 2)
+        # Snap floor/ceil
+        def snap_floor(x: int, s: int) -> int:
+            return (x // s) * s
+        def snap_ceil(x: int, s: int) -> int:
+            return ((x + s - 1) // s) * s
+        s_lo = snap_floor(lower, tick_spacing)
+        s_up = snap_ceil(upper, tick_spacing)
+        snapped = (s_lo, s_up) != (lower, upper)
+        if s_lo >= s_up:
+            return {"ok": False, "error": "tick range colapsó tras snapping", "tick_spacing": tick_spacing}
+        return {"ok": True, "ticks": {"lower": s_lo, "upper": s_up}, "snapped": snapped, "tick_spacing": tick_spacing}
+
     def resolve_pool_id(self, token_a: str, token_b: str, fee_bps: int) -> Dict[str, Any]:
         """Resuelve pool por tokens y fee usando el lookup del adaptador."""
         try:
