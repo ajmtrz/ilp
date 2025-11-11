@@ -307,6 +307,147 @@ class RaydiumAdapter:
             return ((int(tick) + spacing - 1) // spacing) * spacing
         return (int(tick) // spacing) * spacing
 
+    def open_position(
+        self,
+        pool_id: str,
+        ticks: Dict[str, int],
+        amounts: Dict[str, int],
+        slippage_bps: int = 50,
+    ) -> Dict[str, Any]:
+        """Abre una nueva posición CLMM en una única llamada (prepara y envía).
+        - Deriva mints y fee_bps desde la pool.
+        - Construye quote por ticks y prepara tx V0.
+        - Envía todas las transacciones resultantes en orden.
+        """
+        if not pool_id:
+            return {"ok": False, "error": "pool_id requerido"}
+        try:
+            tick_lower = int(ticks.get("lower"))
+            tick_upper = int(ticks.get("upper"))
+        except Exception:
+            return {"ok": False, "error": "ticks inválidos"}
+        amount0 = int(amounts.get("amount0", 0) or amounts.get("amountA", 0) or 0)
+        amount1 = int(amounts.get("amount1", 0) or amounts.get("amountB", 0) or 0)
+
+        # Derivar mints y fee_bps desde info de la pool
+        info = self.get_pool_info(pool_id) or {}
+        # mints desde estado (más robusto que info plano)
+        st = self.get_pool_state_decoded(pool_id) or {}
+        mintA, mintB = self.get_pool_mints(st)
+        if not (mintA and mintB):
+            # Intentar extraer desde info si estado no las trae
+            try:
+                ma_obj = info.get("mintA") or {}
+                mb_obj = info.get("mintB") or {}
+                mintA = mintA or ma_obj.get("address") or ma_obj.get("mint")
+                mintB = mintB or mb_obj.get("address") or mb_obj.get("mint")
+            except Exception:
+                pass
+        if not (mintA and mintB):
+            return {"ok": False, "error": "no se pudieron derivar los mints de la pool"}
+
+        # fee_bps: preferir config.tradeFeeRate (ppm) -> bps; fallback a feeRate o feeBps
+        fee_bps_val = None
+        try:
+            cfg = info.get("config") or {}
+            tr = cfg.get("tradeFeeRate")
+            if tr is not None:
+                fee_bps_val = int(round(float(tr) / 100.0))
+        except Exception:
+            fee_bps_val = None
+        if fee_bps_val is None:
+            try:
+                fr = info.get("feeRate")
+                if fr is not None:
+                    fee_bps_val = int(round(float(fr) * 1e4))
+            except Exception:
+                fee_bps_val = None
+        if fee_bps_val is None:
+            try:
+                fb = info.get("feeBps")
+                if fb is not None:
+                    fee_bps_val = int(fb)
+            except Exception:
+                fee_bps_val = None
+        fee_bps_val = int(fee_bps_val or 0)
+
+        # Construir quote y preparar tx
+        quote = self.liquidity_quote_by_ticks(
+            mintA=mintA,
+            mintB=mintB,
+            fee_bps=fee_bps_val,
+            tick_lower=tick_lower,
+            tick_upper=tick_upper,
+            amountA_desired=amount0,
+            amountB_desired=amount1,
+            slippage_bps=int(slippage_bps),
+        )
+        if not isinstance(quote, dict) or not quote.get("exists", True):
+            return {"ok": False, "error": "liquidity_quote_by_ticks falló", "details": quote}
+        prep = self.liquidity_prepare(quote)
+        # Delegar el envío al pipeline que gestiona extraSigners de Anchor
+        res = self.liquidity_send(prep, wait=True)
+        return res
+
+    def ensure_token_accounts(self, tokens: List[str]) -> Dict[str, Any]:
+        """Comprueba ATAs para los mints indicados y crea los que falten si es posible.
+        - Para SOL nativo no se crea ATA; WSOL se maneja de forma temporal en los flujos del adaptador.
+        """
+        created: List[Dict[str, Any]] = []
+        exists: Dict[str, Any] = {}
+        errs: List[Dict[str, str]] = []
+        owner = self.owner_pubkey
+        for mint in tokens or []:
+            try:
+                if self._is_sol_mint(mint):
+                    exists[mint] = {"ata": None, "exists": True, "native": True}
+                    continue
+                ata = self._derive_ata(owner, mint)
+                if not ata:
+                    exists[mint] = {"ata": None, "exists": False}
+                    continue
+                info = self._get_account_info_base64(ata)
+                if info:
+                    exists[mint] = {"ata": ata, "exists": True}
+                    continue
+                # Crear ATA vía spl.associated_token_account
+                try:
+                    from solana.rpc.api import Client  # type: ignore
+                    from solana.transaction import Transaction  # type: ignore
+                    from solana.keypair import Keypair as SolKeypair  # type: ignore
+                    from spl.token.instructions import create_associated_token_account  # type: ignore
+                except Exception as exc:
+                    errs.append({"mint": mint, "error": f"dependencias solana/spl faltan: {exc}"})
+                    exists[mint] = {"ata": ata, "exists": False}
+                    continue
+                # Cargar keypair en formato solana-py
+                try:
+                    import json, os
+                    expanded_path = os.path.expanduser(self.config.keypair_path)
+                    with open(expanded_path, "r", encoding="utf-8") as f:
+                        key_data = json.load(f)
+                    sk = SolKeypair.from_secret_key(bytes(key_data))
+                except Exception as exc:
+                    errs.append({"mint": mint, "error": f"no se pudo cargar keypair: {exc}"})
+                    exists[mint] = {"ata": ata, "exists": False}
+                    continue
+                # Construir y enviar tx legacy
+                tx = Transaction()
+                ix = create_associated_token_account(payer=sk.public_key, owner=sk.public_key, mint=mint)
+                tx.add(ix)
+                client = self._rpc_client()
+                resp = client.send_transaction(tx, sk)
+                created.append({"mint": mint, "ata": ata, "result": resp})
+                exists[mint] = {"ata": ata, "exists": True}
+            except Exception as exc:
+                errs.append({"mint": str(mint), "error": str(exc)})
+        ok = all(v.get("exists") for v in exists.values())
+        out: Dict[str, Any] = {"ok": ok, "owner": owner, "exists": exists}
+        if created:
+            out["created"] = created
+        if errs:
+            out["errors"] = errs
+        return out
     def range_to_ticks(self, pool_id: str, range_spec: Dict[str, Any]) -> Dict[str, Any]:
         """Convierte center/width a ticks válidos alineados a tickSpacing de la pool."""
         # Determinar tick_spacing desde estado on-chain o info API

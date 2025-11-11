@@ -877,11 +877,11 @@ class SaucerSwapAdapter:
         if not self._master_chef_addr:
             raise RuntimeError("master_chef debe estar configurado en YAML")
 
-        sel_df = eth_utils.keccak(text="depositFee()")[:4]
-        res_df = self._call_rpc("eth_call", [{"to": self._master_chef_addr, "data": "0x" + sel_df.hex()}, "latest"])
-        tinycent = int(abi_decode(["uint256"], bytes.fromhex(res_df[2:]))[0])
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug("get_mint_fee: masterChef.depositFee tinycent=%s", tinycent)
+            sel_df = eth_utils.keccak(text="depositFee()")[:4]
+            res_df = self._call_rpc("eth_call", [{"to": self._master_chef_addr, "data": "0x" + sel_df.hex()}, "latest"])
+            tinycent = int(abi_decode(["uint256"], bytes.fromhex(res_df[2:]))[0])
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("get_mint_fee: masterChef.depositFee tinycent=%s", tinycent)
 
         # 2) tinycent -> tinybars vía MasterChef.tinycentsToTinybars(uint256)
         if not self._master_chef_addr:
@@ -1349,16 +1349,16 @@ class SaucerSwapAdapter:
                     if token0_hts.count(".") == 2:
                         res0 = self.approve_hts_execute(token_id=token0_hts, spender_contract_id=npm_hts)
                         approve_steps.append({"hts_allow_token0": res0})
-                        # Poll hasta ver allowance suficiente
-                        try:
-                            import time as _t
-                            for _ in range(20):
-                                _t.sleep(1)
-                                chk0 = self.allowance_check(token0_hts, spender=npm_hts)
-                                if int(chk0.get("allowance", 0)) >= int(a0_des):
-                                    break
-                        except Exception:
-                            pass
+                    # Poll hasta ver allowance suficiente
+                    try:
+                        import time as _t
+                        for _ in range(20):
+                            _t.sleep(1)
+                            chk0 = self.allowance_check(token0_hts, spender=npm_hts)
+                            if int(chk0.get("allowance", 0)) >= int(a0_des):
+                                break
+                    except Exception:
+                        pass
                     else:
                         notes.append("token0 no HTS: se omite approve HTS explícito (usar allowance ERC20 si aplica)")
             # token1
@@ -1368,15 +1368,15 @@ class SaucerSwapAdapter:
                     if token1_hts.count(".") == 2:
                         res1 = self.approve_hts_execute(token_id=token1_hts, spender_contract_id=npm_hts)
                         approve_steps.append({"hts_allow_token1": res1})
-                        try:
-                            import time as _t
-                            for _ in range(20):
-                                _t.sleep(1)
-                                chk1 = self.allowance_check(token1_hts, spender=npm_hts)
-                                if int(chk1.get("allowance", 0)) >= int(a1_des):
-                                    break
-                        except Exception:
-                            pass
+                    try:
+                        import time as _t
+                        for _ in range(20):
+                            _t.sleep(1)
+                            chk1 = self.allowance_check(token1_hts, spender=npm_hts)
+                            if int(chk1.get("allowance", 0)) >= int(a1_des):
+                                break
+                    except Exception:
+                        pass
                     else:
                         notes.append("token1 no HTS: se omite approve HTS explícito (usar allowance ERC20 si aplica)")
             # En Hedera algunas rutas usan allowance directo al Pool; añadimos como refuerzo no bloqueante
@@ -1473,8 +1473,9 @@ class SaucerSwapAdapter:
         except Exception as exc:
             notes.append(f"balance check error: {exc}")
 
-        # msg.value: cubrir únicamente mintFee (alineado a UI). No enviar déficit WHBAR
+        # msg.value: cubrir mintFee y, si aplica auto-wrap, sumar depósito HBAR necesario (deficit WHBAR)
         value_hex = None
+        deposit_wei = 0
         try:
             whbar_hts = getattr(self, "_whbar_token_id", lambda: None)()
             if not whbar_hts:
@@ -1495,14 +1496,8 @@ class SaucerSwapAdapter:
                     fee_wei_val = int(mf["wei"])  # tinybars->wei ya convertido en get_mint_fee
             except Exception:
                 fee_wei_val = 0
-            # Solo mintFee; no añadir déficit WHBAR al value
-            total_wei = fee_wei_val
-            if total_wei > 0:
-                value_hex = hex(total_wei)
-                tx["value"] = value_hex
-                notes.append(f"msg.value = mintFee({fee_wei_val})")
         except Exception as _vx:
-            notes.append(f"value calc warn: {_vx}")
+            notes.append(f"value calc warn (fee): {_vx}")
 
         # Auto-wrap HBAR->WHBAR previo al mint si hay déficit WHBAR y saldo HBAR suficiente
         try:
@@ -1536,6 +1531,7 @@ class SaucerSwapAdapter:
                         import eth_utils  # type: ignore
                         sel_deposit = eth_utils.keccak(text="deposit()")[:4]
                         wrap_value_wei = int(deficit_wh) * (10 ** 10)
+                        deposit_wei = wrap_value_wei
                         approve_steps.append({
                             "from": self.evm_address,
                             "to": helper_addr,
@@ -1551,6 +1547,19 @@ class SaucerSwapAdapter:
                         notes.append(f"auto-wrap skipped: hbar_tb={hbar_tb} < deficit_wh={deficit_wh}")
         except Exception as _awx:
             notes.append(f"auto-wrap warn: {_awx}")
+
+        # Establecer msg.value final (mintFee + depósito si hubo auto-wrap calculado)
+        try:
+            total_wei = int(fee_wei_val) + int(deposit_wei or 0)
+            if total_wei > 0:
+                value_hex = hex(total_wei)
+                tx["value"] = value_hex
+                if deposit_wei:
+                    notes.append(f"msg.value = mintFee({fee_wei_val}) + deposit({deposit_wei})")
+                else:
+                    notes.append(f"msg.value = mintFee({fee_wei_val})")
+        except Exception as _vx2:
+            notes.append(f"value calc warn (total): {_vx2}")
 
         # Guard de desviación: abortar si el tick actual se alejó demasiado del plan
         try:
@@ -2204,6 +2213,58 @@ class SaucerSwapAdapter:
         prep = self.liquidity_prepare(quote, deadline_s=300)
         return prep
 
+    def open_position(
+        self,
+        pool_id: Union[int, str],
+        ticks: Dict[str, int],
+        amounts: Dict[str, int],
+        slippage_bps: int = 50,
+    ) -> Dict[str, Any]:
+        """Abre una nueva posición (mint) delegando el envío a liquidity_send para manejar pasos previos."""
+        try:
+            info = self.get_pool_info(pool_id) or {}
+            t0 = (info.get("token0") or info.get("tokenA") or {})  # normalizado
+            t1 = (info.get("token1") or info.get("tokenB") or {})
+            mintA = t0.get("id") or t0.get("tokenId")
+            mintB = t1.get("id") or t1.get("tokenId")
+            tick_lower = int(ticks.get("lower"))
+            tick_upper = int(ticks.get("upper"))
+            amount0 = int(amounts.get("amount0", 0) or amounts.get("amountA", 0) or 0)
+            amount1 = int(amounts.get("amount1", 0) or amounts.get("amountB", 0) or 0)
+        except Exception as exc:
+            return {"ok": False, "error": f"inputs inválidos: {exc}"}
+
+        prep = self.liquidity_prepare_open(
+            pool_id=pool_id,
+            tick_lower=tick_lower,
+            tick_upper=tick_upper,
+            mintA=str(mintA),
+            mintB=str(mintB),
+            amount0_desired=amount0,
+            amount1_desired=amount1,
+            slippage_bps=int(slippage_bps),
+        )
+        # Respetar guardias y ejecutar pasos (wrap/approvals) + mint en un flujo consistente
+        if not bool(prep.get("canSend", True)):
+            return {"ok": False, "error": "canSend=false", "details": {"notes": prep.get("notes")}}
+        return self.liquidity_send(prep, wait=True)
+
+    def ensure_token_accounts(self, tokens: List[str]) -> Dict[str, Any]:
+        """Asegura que la cuenta está asociada a los tokens HTS indicados.
+        - Usa Mirror Node para comprobar asociación y Hedera SDK para asociar si falta.
+        """
+        not_assoc: List[str] = []
+        details: Dict[str, Any] = {}
+        for t in tokens or []:
+            chk = self.check_associated(t, self.account_id)
+            details[t] = chk
+            if not chk.get("associated"):
+                not_assoc.append(t)
+        if not not_assoc:
+            return {"ok": True, "executed": False, "reason": "ya asociados", "details": details}
+        exec_res = self.associate_execute(not_assoc, self.account_id)
+        return {"ok": True, "executed": True, "association": exec_res, "details": details}
+
     def _strip_fields(self, pos: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = dict(pos)
         for key in ("token0", "token1"):
@@ -2756,8 +2817,8 @@ class SaucerSwapAdapter:
 
         # Si falta gas, intenta estimar
         if "gas" not in tx_to_sign:
-            est = self._call_rpc("eth_estimateGas", [{"from": address_from, "to": tx["to"], "data": tx_to_sign["data"], "value": hex(tx_to_sign.get("value", 0)) if tx_to_sign.get("value") else "0x0"}, "latest"])
-            tx_to_sign["gas"] = int(est, 16) if isinstance(est, str) else est
+                est = self._call_rpc("eth_estimateGas", [{"from": address_from, "to": tx["to"], "data": tx_to_sign["data"], "value": hex(tx_to_sign.get("value", 0)) if tx_to_sign.get("value") else "0x0"}, "latest"])
+                tx_to_sign["gas"] = int(est, 16) if isinstance(est, str) else est
 
         # Firmar y enviar
         acct = Account.from_key(bytes.fromhex(self._private_key_hex))

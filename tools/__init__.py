@@ -190,3 +190,53 @@ def close_position(*, protocol: str, project_root: str = "/root/Repositorios/ild
     if hasattr(adapter, "close_position"):
         return adapter.close_position(position_id=position_id, slippage_bps=int(slippage_bps))
     return {"ok": False, "error": "close_position no soportado"}
+
+def get_swap_quote(*, protocol: str, project_root: str = "/root/Repositorios/ild", token_in: str, token_out: str, amount: int, kind: str = "exact_in", fee_bps: Optional[int] = None, slippage_bps: int = 50, route_hops: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Obtiene una cotización de swap sin ejecutar.
+    - kind: 'exact_in' o 'exact_out'
+    - fee_bps: requerido por algunos protocolos (p.ej., SaucerSwap). Si falta y el adaptador lo requiere, devuelve error.
+    - route_hops: lista opcional de hops [{token, fee_bps}] para rutas multi-hop (si el adaptador lo soporta).
+    """
+    factory = AdapterFactory(project_root)
+    adapter = factory.get(protocol)
+    if hasattr(adapter, "get_quote"):
+        try:
+            import inspect
+            fn = getattr(adapter, "get_quote")
+            params = set(inspect.signature(fn).parameters.keys())
+            kwargs = {}
+            # Asignar nombres según firma del adaptador
+            if "input_mint" in params: kwargs["input_mint"] = token_in
+            if "output_mint" in params: kwargs["output_mint"] = token_out
+            if "token_in" in params: kwargs["token_in"] = token_in
+            if "token_out" in params: kwargs["token_out"] = token_out
+            if "amount" in params: kwargs["amount"] = int(amount)
+            if "kind" in params: kwargs["kind"] = str(kind)
+            if "slippage_bps" in params: kwargs["slippage_bps"] = int(slippage_bps)
+            if "fee_bps" in params:
+                if fee_bps is None:
+                    return {"ok": False, "error": "fee_bps requerido por este protocolo"}
+                kwargs["fee_bps"] = int(fee_bps)
+            if "route_hops" in params and route_hops is not None:
+                # normalizar route_hops -> List[Tuple[token, fee]]
+                hops: List = []
+                for h in route_hops or []:
+                    t = h.get("token"); f = h.get("fee_bps")
+                    if t is not None and f is not None:
+                        hops.append((str(t), int(f)))
+                kwargs["route_hops"] = hops
+            return fn(**kwargs)
+        except Exception as exc:
+            return {"ok": False, "error": f"get_quote: {exc}"}
+    return {"ok": False, "error": "get_swap_quote no soportado"}
+
+def ensure_token_accounts(*, protocol: str, project_root: str = "/root/Repositorios/ild", tokens: List[str]) -> Dict[str, Any]:
+    """Prepara la wallet para operar con los tokens indicados (agnóstico).
+    - En entornos Solana: asegurar ATAs/WSOL según política del adaptador.
+    - En entornos Hedera: auto-association de tokens HTS si faltan.
+    """
+    factory = AdapterFactory(project_root)
+    adapter = factory.get(protocol)
+    if hasattr(adapter, "ensure_token_accounts"):
+        return adapter.ensure_token_accounts(tokens)
+    return {"ok": False, "error": "ensure_token_accounts no soportado"}
